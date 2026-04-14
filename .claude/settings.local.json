@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(snowsql -a BL89401-GV68296 -u justin.barr@skyzone.com --authenticator externalbrowser -q \"SELECT * FROM PROD_EDW2_SHARE_GOLD_DB.DW.DIMLOCATION WHERE LOCATIONID = 'Apex, NC - 151' LIMIT 10;\")"
+    ]
+  }
+}
