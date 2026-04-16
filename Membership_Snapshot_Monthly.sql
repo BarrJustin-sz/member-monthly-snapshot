@@ -21,8 +21,8 @@ active_members AS (
     FROM parks_base pb
     JOIN SKYZONE_BI.DATAMART.MEMBERSHIP_EVENTS f
         ON  f.SK_LOCATION         = pb.SK_LOCATION
-        AND f.SK_JOIN_DATE         < pb.MONTH_START
-        AND (f.SK_TERMINATION_DATE IS NULL OR f.SK_TERMINATION_DATE >= pb.MONTH_START)
+        AND f.JOIN_DATE         <= pb.MONTH_START
+        AND (f.TERMINATION_DATE IS NULL OR f.TERMINATION_DATE >= pb.MONTH_START)
     GROUP BY 1, 2
 ),
 
@@ -30,18 +30,18 @@ active_members AS (
 -- Includes all tickets with a join date — genuine new sales AND upgrade child tickets
 new_members AS (
     SELECT
-          DATE_TRUNC('MONTH', SK_JOIN_DATE) AS MONTH_START
+          DATE_TRUNC('MONTH', JOIN_DATE) AS MONTH_START
         , SK_LOCATION
         , COUNT(DISTINCT TICKETID)          AS NEW_MEMBERS
     FROM SKYZONE_BI.DATAMART.MEMBERSHIP_EVENTS
-    WHERE SK_JOIN_DATE IS NOT NULL
+    WHERE JOIN_DATE IS NOT NULL
     GROUP BY 1, 2
 ),
 
 -- Upgrades per park per month (by upgrade date), split by prior status
 upgrades AS (
     SELECT
-          DATE_TRUNC('MONTH', SK_UPGRADE_DATE)                                                               AS MONTH_START
+          DATE_TRUNC('MONTH', UPGRADE_DATE)                                                               AS MONTH_START
         , SK_LOCATION
         , COUNT(DISTINCT CASE WHEN LAST_STATUS = 'Upgraded From Active'   THEN TICKETID END)  AS UPGRADED_FROM_ACTIVE
         , COUNT(DISTINCT CASE WHEN LAST_STATUS = 'Upgraded From Inactive' THEN TICKETID END)  AS UPGRADED_FROM_INACTIVE
@@ -54,7 +54,7 @@ upgrades AS (
 -- Cancellations broken out by reason, per park per month (using SK_ATTRITION_DATE)
 cancels AS (
     SELECT
-          DATE_TRUNC('MONTH', SK_ATTRITION_DATE)                                                   AS MONTH_START
+          DATE_TRUNC('MONTH', ATTRITION_DATE)                                                   AS MONTH_START
         , SK_LOCATION
         , SUM(CASE WHEN ATTRITION_REASON IN ('Assumed Cancelled', 'Cancelled', 'Cancel Requested')  THEN 1 ELSE 0 END) AS CANCELLED
         , SUM(CASE WHEN ATTRITION_REASON = 'Payment Issue'                                          THEN 1 ELSE 0 END) AS PAYMENT_ISSUE
@@ -67,7 +67,7 @@ cancels AS (
         , SUM(CASE WHEN (RECURR_PAY_COUNT = 0 OR RECURR_PAY_COUNT IS NULL)
                         AND LAST_STATUS NOT IN ('Upgraded From Active', 'Upgraded From Inactive') THEN 1 ELSE 0 END) AS CANCELS_PRE_RECURRING
     FROM SKYZONE_BI.DATAMART.MEMBERSHIP_EVENTS
-    WHERE SK_ATTRITION_DATE IS NOT NULL
+    WHERE ATTRITION_DATE IS NOT NULL
     GROUP BY 1, 2
 )
 
@@ -116,6 +116,5 @@ LEFT JOIN upgrades u
 LEFT JOIN cancels c
     ON  c.SK_LOCATION = pb.SK_LOCATION
     AND c.MONTH_START = pb.MONTH_START
-WHERE dl.LOCATIONID = 'Aurora, CO - 130'
 ORDER BY pb.MONTH_START DESC, dl.LOCATIONID
 ;
