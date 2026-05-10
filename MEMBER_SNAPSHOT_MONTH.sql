@@ -35,7 +35,7 @@ parks_base AS (
     GROUP BY 1, 2
 ),
 -- Active member count at start of each month per park
--- A member is active if they joined before month-start and their termination date has not yet passed
+-- A member is active if they joined before month-start or during the month and their termination date has not yet passed
 mbr_active AS (
     SELECT
           pb.MONTH_START
@@ -225,5 +225,6 @@ LEFT JOIN mbr_osat o
 LEFT JOIN GOLD_DB.CNS.TBL_DIMLOCATION dl
     ON  dl.SK_LOCATION    = pb.SK_LOCATION
     AND dl.DWISCURRENTFLAG = 1
+WHERE dl.LOCATIONID = 'Apex, NC - 151'
 ORDER BY pb.MONTH_START DESC, dl.LOCATIONID
 ;
