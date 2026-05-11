@@ -227,10 +227,7 @@ LEFT JOIN mbr_parent_addon pa
 LEFT JOIN mbr_osat o
     ON  o.SK_LOCATION = pb.SK_LOCATION
     AND o.MONTH_START = pb.MONTH_START
-LEFT JOIN GOLD_DB.CNS.TBL_DIMLOCATION dl
-    ON  dl.SK_LOCATION    = pb.SK_LOCATION
-    AND dl.DWISCURRENTFLAG = 1
 -- Only show months where the full calendar month is complete 
 WHERE pb.MONTH_START <= DATE_TRUNC('MONTH', CURRENT_DATE)
-ORDER BY pb.MONTH_START DESC, dl.LOCATIONID
+ORDER BY pb.MONTH_START DESC
 ;
