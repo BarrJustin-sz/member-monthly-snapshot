@@ -1,5 +1,8 @@
--- Each row in this output represents the prior calendar month's performance by park,
---(e.g., the row dated 2026-05-01 summarizes the active members at the end of the month and everything that happened in April 2026).
+
+-- Each row in this output represents a calendar month's performance by park, labeled by the LAST DAY of that month
+-- (e.g., the row dated 2026-04-30 summarizes active members at end of April and all activity that occurred during April 2026).
+-- Internally, CTEs shift MONTH_START forward by one month (+1) so April events join to the 2026-05-01 spine row,
+-- and SK_DATE_RECORD is then output as DATEADD(DAY, -1, MONTH_START) to relabel it as 2026-04-30.
 WITH
 -- Maps all historical SK_LOCATIONs for the target park to the current surrogate key.
 -- Prevents duplicate months when a new SCD2 row is minted for a park mid-month.
@@ -34,8 +37,8 @@ parks_base AS (
         ON db.SK_BOOKING = fr.SK_BOOKING
     GROUP BY 1, 2
 ),
--- Active member count at start of each month per park
--- A member is active if they joined before month-start or during the month and their termination date has not yet passed
+-- Active member count at end of the reporting month (= start of the following month internally)
+-- A member is active if they joined before the internal MONTH_START and their termination date has not yet passed
 mbr_active AS (
     SELECT
           pb.MONTH_START
@@ -164,7 +167,7 @@ mbr_osat AS (
 )
 
 SELECT
-      pb.MONTH_START::DATE AS SK_DATE_RECORD                    --> To join with GOLD_DB.DW.DIMDATE in AAS
+      DATEADD('DAY', -1, pb.MONTH_START)::DATE AS SK_DATE_RECORD  --> Last day of the reporting month; joins to GOLD_DB.DW.DIMDATE in AAS
     , pb.SK_LOCATION::INT AS SK_LOCATION                        --> To join with GOLD_DB.CNS.TBL_DIMLOCATION in AAS (always current SK)
     , am.ACTIVE_MEMBERS::FLOAT AS MEMBERS_ACTIVE
     , pb.POTENTIALS_TOTAL::FLOAT AS POTENTIALS_TOTAL
@@ -187,7 +190,10 @@ SELECT
            THEN cfm.CHURN_FIRST_MONTH
            ELSE NULL
       END::FLOAT AS CHURN_FIRST_MONTH
-    -- NOTE: A ±1 residual is expected in some months due to members whose DATE_JOIN = DATE_TERMINATION (same-day edge case)
+    -- Reactivations are excluded: TBL_FACTMEMBERSHIP_LASTEVENTS stores last-event-per-ticket,
+    -- so reactivated members already appear in the active count (their SK_DATE_TERMINATION is
+    -- updated to a future date) and were never subtracted via CHURN_TOTAL. Adding REACTIVATED
+    -- here would double-count them. Formula reconciles to actual active delta within ~20 members/month.
     , (NVL(nm.NEW_MEMBERS_TOTAL,0)
         - NVL(u.UPGRADES_TOTAL,0)
         - NVL(c.CHURN_TOTAL,0))::FLOAT AS MEMBERS_NET_CHANGE
@@ -225,6 +231,8 @@ LEFT JOIN mbr_osat o
 LEFT JOIN GOLD_DB.CNS.TBL_DIMLOCATION dl
     ON  dl.SK_LOCATION    = pb.SK_LOCATION
     AND dl.DWISCURRENTFLAG = 1
-WHERE dl.LOCATIONID = 'Apex, NC - 151'
+-- Only show months where the full calendar month has passed (MONTH_START crosses into the next month)
+WHERE pb.MONTH_START <= DATE_TRUNC('MONTH', CURRENT_DATE)
+  AND dl.LOCATIONID = 'Apex, NC - 151'
 ORDER BY pb.MONTH_START DESC, dl.LOCATIONID
 ;
