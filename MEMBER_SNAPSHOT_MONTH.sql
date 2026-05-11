@@ -1,8 +1,7 @@
 
 -- Each row in this output represents a calendar month's performance by park, labeled by the LAST DAY of that month
 -- (e.g., the row dated 2026-04-30 summarizes active members at end of April and all activity that occurred during April 2026).
--- Internally, CTEs shift MONTH_START forward by one month (+1) so April events join to the 2026-05-01 spine row,
--- and SK_DATE_RECORD is then output as DATEADD(DAY, -1, MONTH_START) to relabel it as 2026-04-30.
+-- Internally, CTEs shift MONTH_START forward by one month (+1) and SK_DATE_RECORD is then output as DATEADD(DAY, -1, MONTH_START) to relabel it as end of the month.
 WITH
 -- Maps all historical SK_LOCATIONs for the target park to the current surrogate key.
 -- Prevents duplicate months when a new SCD2 row is minted for a park mid-month.
@@ -231,8 +230,7 @@ LEFT JOIN mbr_osat o
 LEFT JOIN GOLD_DB.CNS.TBL_DIMLOCATION dl
     ON  dl.SK_LOCATION    = pb.SK_LOCATION
     AND dl.DWISCURRENTFLAG = 1
--- Only show months where the full calendar month has passed (MONTH_START crosses into the next month)
+-- Only show months where the full calendar month is complete 
 WHERE pb.MONTH_START <= DATE_TRUNC('MONTH', CURRENT_DATE)
-  AND dl.LOCATIONID = 'Apex, NC - 151'
 ORDER BY pb.MONTH_START DESC, dl.LOCATIONID
 ;
