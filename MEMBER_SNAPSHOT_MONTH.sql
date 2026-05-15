@@ -7,31 +7,58 @@ WITH
 -- Prevents duplicate months when a new SCD2 row is minted for a park mid-month.
 location_map AS (
     SELECT
-          h.SK_LOCATION  AS HIST_SK
-        , c.SK_LOCATION  AS CURRENT_SK
-    FROM GOLD_DB.CNS.TBL_DIMLOCATION h
-    JOIN GOLD_DB.CNS.TBL_DIMLOCATION c
-        ON  c.LOCATIONID       = h.LOCATIONID
-        AND c.DWISCURRENTFLAG  = 1
-    WHERE h.COUNTRY IN ('US', 'CA', 'Hong Kong')
+          SK_LOCATION
+    FROM GOLD_DB.CNS.TBL_DIMLOCATION
+    WHERE COUNTRY IN ('US', 'CA', 'Hong Kong')
 ),
 -- Pre-normalize TBL_FACTMEMBERSHIP_LASTEVENTS to the current SK for this park.
 -- All downstream membership CTEs use this instead of the raw fact table.
 mbr_facts_base AS (
-    SELECT f.*, lm.CURRENT_SK AS SK_LOC_NORM
+    SELECT       
+      f.SK_LOCATION
+    , f.SK_PRODUCT
+    , f.SK_BOOKING
+    , f.SK_TICKET
+    , f.SK_BOOKINGCREATEDBYEMPLOYEE
+    , f.SK_HOUSEHOLD
+    , f.SK_JUMPERCUSTOMER
+    , f.SK_PURCHASINGCUSTOMER
+    , f.SK_DATE_JOIN
+    , f.SK_DATE_LAST_CHECKIN
+    , f.SK_DATE_UPGRADE
+    , f.SK_DATE_LAST_REFUND
+    , f.SK_DATE_CANCEL
+    , f.SK_DATE_TERMINATION
+    , f.SK_DATE_RECURR_LAST_PAY
+    , f.SK_DATE_RECURR_NEXT_PAY
+    , f.BOOKINGITEMID
+    , f.CONV_TYPE
+    , f.STATUS_LAST
+    , f.STATUS_ROLLER
+    , f.CANCEL_REASON
+    , f.CUSTOMER_JUMPER
+    , f.CUSTOMER_PURCHASE
+    , f.STATUS_PROJ
+    , f.STATUS_ACTIVE
+    , f.CHECKIN_COUNT
+    , f.PAY_INITIAL
+    , f.RECURR_AVG_DUES
+    , f.RECURR_PAY_COUNT
+    , f.REFUND_COUNT
+    , f.CANCEL_DAYS
     FROM GOLD_DB.CNS.TBL_FACTMEMBERSHIP_LASTEVENTS f
-    JOIN location_map lm ON lm.HIST_SK = f.SK_LOCATION
+    JOIN location_map lm USING(SK_LOCATION)
 ),
 -- Base: park x month from revenue, sum pre-calculated potentials split by booking channel
 parks_base AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fr.SK_DATE_RECORD))  AS MONTH_START
-        , lm.CURRENT_SK AS SK_LOCATION
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fr.SK_DATE_RECORD))                                                           AS MONTH_START
+        , lm.SK_LOCATION                                                                                                        AS SK_LOCATION
         , SUM(CASE WHEN db.BOOKINGLOCATIONSTANDARDIZED NOT IN ('Online Sales', 'Venue Manager') THEN fr.POTENTIALS ELSE 0 END)  AS POTENTIALS_INPARK
-        , SUM(CASE WHEN db.BOOKINGLOCATIONSTANDARDIZED IN ('Online Sales', 'Venue Manager')    THEN fr.POTENTIALS ELSE 0 END)  AS POTENTIALS_ONLINE
-        , SUM(fr.POTENTIALS) AS POTENTIALS_TOTAL
+        , SUM(CASE WHEN db.BOOKINGLOCATIONSTANDARDIZED IN ('Online Sales', 'Venue Manager')    THEN fr.POTENTIALS ELSE 0 END)   AS POTENTIALS_ONLINE
+        , SUM(fr.POTENTIALS)                                                                                                    AS POTENTIALS_TOTAL
     FROM GOLD_DB.CNS.TBL_FACTREVENUE fr
-    JOIN location_map lm ON lm.HIST_SK = fr.SK_LOCATION
+    JOIN location_map lm USING(SK_LOCATION)
     LEFT JOIN GOLD_DB.DW.DIMBOOKING db
         ON db.SK_BOOKING = fr.SK_BOOKING
     GROUP BY 1, 2
@@ -45,7 +72,7 @@ mbr_active AS (
         , COUNT(DISTINCT f.SK_TICKET) AS ACTIVE_MEMBERS
     FROM parks_base pb
     JOIN mbr_facts_base f
-        ON  f.SK_LOC_NORM         = pb.SK_LOCATION
+        ON  f.SK_LOCATION         = pb.SK_LOCATION
         AND f.SK_DATE_JOIN        < pb.MONTH_START
         AND (f.SK_DATE_TERMINATION IS NULL OR f.SK_DATE_TERMINATION >= pb.MONTH_START)
     GROUP BY 1, 2
@@ -55,11 +82,11 @@ mbr_active AS (
 -- CONV_TYPE values: 'In Store', 'Online Sales', 'Data Import', 'Venue Manager', NULL
 mbr_new AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))                        AS MONTH_START
-        , f.SK_LOC_NORM                                                                 AS SK_LOCATION
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))                                          AS MONTH_START
+        , f.SK_LOCATION                                                                                     AS SK_LOCATION
         , COUNT(DISTINCT CASE WHEN f.CONV_TYPE NOT IN ('Online Sales', 'Venue Manager') THEN TICKETID END)  AS NEW_MEMBERS_INPARK
         , COUNT(DISTINCT CASE WHEN f.CONV_TYPE IN ('Online Sales', 'Venue Manager')     THEN TICKETID END)  AS NEW_MEMBERS_ONLINE
-        , COUNT(DISTINCT t.TICKETID)                                                    AS NEW_MEMBERS_TOTAL
+        , COUNT(DISTINCT t.TICKETID)                                                                        AS NEW_MEMBERS_TOTAL
     FROM mbr_facts_base f
     JOIN GOLD_DB.DW.DIMTICKET t USING(SK_TICKET)
     WHERE f.SK_DATE_JOIN IS NOT NULL
@@ -68,9 +95,9 @@ mbr_new AS (
 -- Upgrades per park per month (by upgrade date)
 mbr_upgrades AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_UPGRADE))    AS MONTH_START
-        , f.SK_LOC_NORM                             AS SK_LOCATION
-        , COUNT(DISTINCT t.TICKETID)                AS UPGRADES_TOTAL
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_UPGRADE))       AS MONTH_START
+        , f.SK_LOCATION                                                     AS SK_LOCATION
+        , COUNT(DISTINCT t.TICKETID)                                        AS UPGRADES_TOTAL
     FROM mbr_facts_base f
     JOIN GOLD_DB.DW.DIMTICKET t USING(SK_TICKET)
     WHERE f.CANCEL_REASON = 'Upgraded'
@@ -80,14 +107,14 @@ mbr_upgrades AS (
 -- BUG FIX: Voluntary includes ('Cancel Requested', 'Refund', 'Cancel Assumed') and the legacy 'Term Roller'
 mbr_churn AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_TERMINATION))                       AS MONTH_START
-        , f.SK_LOC_NORM                                                                        AS SK_LOCATION
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_TERMINATION))                           AS MONTH_START
+        , f.SK_LOCATION                                                                             AS SK_LOCATION
         -- Voluntary: member-initiated cancels; all non-payment reasons bucketed here so totals reconcile
         , SUM(CASE WHEN f.CANCEL_REASON NOT IN ('Payment Issue', 'Lapsed')
-                    AND f.CANCEL_REASON IS NOT NULL THEN 1 ELSE 0 END)                         AS CHURN_VOLUNTARY
+                    AND f.CANCEL_REASON IS NOT NULL THEN 1 ELSE 0 END)                              AS CHURN_VOLUNTARY
         -- Involuntary: billing failure or lapse due to non-payment
-        , SUM(CASE WHEN f.CANCEL_REASON IN ('Payment Issue', 'Lapsed') THEN 1 ELSE 0 END)      AS CHURN_INVOLUNTARY
-        , COUNT(*)                                                                             AS CHURN_TOTAL
+        , SUM(CASE WHEN f.CANCEL_REASON IN ('Payment Issue', 'Lapsed') THEN 1 ELSE 0 END)           AS CHURN_INVOLUNTARY
+        , COUNT(*)                                                                                  AS CHURN_TOTAL
     FROM mbr_facts_base f
     WHERE f.SK_DATE_TERMINATION IS NOT NULL
       AND f.CANCEL_REASON <> 'Upgraded'
@@ -98,9 +125,9 @@ mbr_churn AS (
 -- A Feb 21 joiner who cancels Mar 5 counts in February here.
 mbr_churn_first_month AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))   AS MONTH_START
-        , f.SK_LOC_NORM                                          AS SK_LOCATION
-        , COUNT(*)                                               AS CHURN_FIRST_MONTH
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))      AS MONTH_START
+        , f.SK_LOCATION                                                 AS SK_LOCATION
+        , COUNT(*)                                                      AS CHURN_FIRST_MONTH
     FROM mbr_facts_base f
     WHERE f.SK_DATE_TERMINATION IS NOT NULL
       AND f.CANCEL_REASON <> 'Upgraded'
@@ -111,11 +138,11 @@ mbr_churn_first_month AS (
 -- A reactivation is any event where SK_EVENTTYPE = 6 ('Reactivated') in FACTMEMBERSHIPPASSEVENTS
 mbr_reactivated AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fm.SK_DATE)) AS MONTH_START
-        , lm.CURRENT_SK                   AS SK_LOCATION
-        , COUNT(DISTINCT fm.SK_TICKET)    AS MEMBERS_REACTIVATED
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fm.SK_DATE))          AS MONTH_START
+        , lm.SK_LOCATION                                                AS SK_LOCATION
+        , COUNT(DISTINCT fm.SK_TICKET)                                  AS MEMBERS_REACTIVATED
     FROM GOLD_DB.CNS.TBL_FACTMEMBERSHIPPASSEVENTS fm
-    JOIN location_map lm ON lm.HIST_SK = fm.SK_LOCATION
+    JOIN location_map lm USING(SK_LOCATION)
     JOIN GOLD_DB.DW.DIMMEMBERSHIPPASSEVENT dm
         USING (SK_EVENTTYPE)
     WHERE dm.EVENTTYPE = 'Reactivated'
@@ -125,8 +152,8 @@ mbr_reactivated AS (
 -- PARENT_ADDONS_UNDER18 uses jumper customer birthdate to flag likely abuse (parent add-on sold to a minor)
 mbr_parent_addon AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', me.SK_DATE_JOIN))                      AS MONTH_START
-        , me.SK_LOC_NORM                                                                AS SK_LOCATION
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', me.SK_DATE_JOIN))                     AS MONTH_START
+        , me.SK_LOCATION                                                                AS SK_LOCATION
         , COUNT(DISTINCT t.TICKETID)                                                    AS PARENT_ADDONS
         , COUNT(DISTINCT CASE WHEN DATEDIFF(year, dc.BIRTHDATE, me.SK_DATE_JOIN) < 18
                                AND DATEDIFF(year, dc.BIRTHDATE, me.SK_DATE_JOIN) > 0
@@ -146,7 +173,7 @@ mbr_parent_addon AS (
 mbr_osat AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fr.SK_DATE_SURVEY))               AS MONTH_START
-        , lm.CURRENT_SK                                                             AS SK_LOCATION
+        , lm.SK_LOCATION                                                            AS SK_LOCATION
         , COUNT(DISTINCT fr.SK_SURVEY)                                              AS OSAT_MEMBER_COUNT
         , COUNT(DISTINCT CASE WHEN fr.RESPONSENUMERIC = '5' THEN fr.SK_SURVEY END)  AS OSAT_5
         , COUNT(DISTINCT CASE WHEN fr.RESPONSENUMERIC = '4' THEN fr.SK_SURVEY END)  AS OSAT_4
@@ -154,7 +181,7 @@ mbr_osat AS (
         , COUNT(DISTINCT CASE WHEN fr.RESPONSENUMERIC = '2' THEN fr.SK_SURVEY END)  AS OSAT_2
         , COUNT(DISTINCT CASE WHEN fr.RESPONSENUMERIC = '1' THEN fr.SK_SURVEY END)  AS OSAT_1
     FROM GOLD_DB.CNS.TBL_FACTSURVEYRESPONSE fr
-    JOIN location_map lm ON lm.HIST_SK = fr.SK_LOCATION
+    JOIN location_map lm USING(SK_LOCATION)
     JOIN GOLD_DB.DW.DIMSATISFACTIONSURVEY ds
         ON  ds.SK_SURVEY      = fr.SK_SURVEY
         AND ds.MEMBERSHIPFLAG = 'Yes'
@@ -230,4 +257,3 @@ LEFT JOIN mbr_osat o
 -- Only show months where the full calendar month is complete 
 WHERE pb.MONTH_START <= DATE_TRUNC('MONTH', CURRENT_DATE)
 ORDER BY pb.MONTH_START DESC
-;
