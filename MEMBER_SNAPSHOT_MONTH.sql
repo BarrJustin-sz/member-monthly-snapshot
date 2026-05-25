@@ -7,7 +7,8 @@ WITH
 -- Prevents duplicate months when a new SCD2 row is minted for a park mid-month.
 location_map AS (
     SELECT
-          SK_LOCATION
+          SK_LOCATION,
+          SK_LOCATION_ACTIVE
     FROM GOLD_DB.CNS.TBL_DIMLOCATION
     WHERE COUNTRY IN ('US', 'CA', 'Hong Kong')
 ),
@@ -16,6 +17,7 @@ location_map AS (
 mbr_facts_base AS (
     SELECT       
       f.SK_LOCATION
+    , lm.SK_LOCATION_ACTIVE
     , f.SK_PRODUCT
     , f.SK_BOOKING
     , f.SK_TICKET
@@ -53,7 +55,7 @@ mbr_facts_base AS (
 parks_base AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fr.SK_DATE_RECORD))                                                           AS MONTH_START
-        , lm.SK_LOCATION                                                                                                        AS SK_LOCATION
+        , lm.SK_LOCATION_ACTIVE                                                                                                 AS SK_LOCATION
         , SUM(CASE WHEN db.BOOKINGLOCATIONSTANDARDIZED NOT IN ('Online Sales', 'Venue Manager') THEN fr.POTENTIALS ELSE 0 END)  AS POTENTIALS_INPARK
         , SUM(CASE WHEN db.BOOKINGLOCATIONSTANDARDIZED IN ('Online Sales', 'Venue Manager')    THEN fr.POTENTIALS ELSE 0 END)   AS POTENTIALS_ONLINE
         , SUM(fr.POTENTIALS)                                                                                                    AS POTENTIALS_TOTAL
@@ -72,7 +74,7 @@ mbr_active AS (
         , COUNT(DISTINCT f.SK_TICKET) AS ACTIVE_MEMBERS
     FROM parks_base pb
     JOIN mbr_facts_base f
-        ON  f.SK_LOCATION         = pb.SK_LOCATION
+        ON  f.SK_LOCATION_ACTIVE  = pb.SK_LOCATION
         AND f.SK_DATE_JOIN        < pb.MONTH_START
         AND (f.SK_DATE_TERMINATION IS NULL OR f.SK_DATE_TERMINATION >= pb.MONTH_START)
     GROUP BY 1, 2
@@ -83,7 +85,7 @@ mbr_active AS (
 mbr_new AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))                                          AS MONTH_START
-        , f.SK_LOCATION                                                                                     AS SK_LOCATION
+        , f.SK_LOCATION_ACTIVE                                                                              AS SK_LOCATION
         , COUNT(DISTINCT CASE WHEN f.CONV_TYPE NOT IN ('Online Sales', 'Venue Manager') THEN TICKETID END)  AS NEW_MEMBERS_INPARK
         , COUNT(DISTINCT CASE WHEN f.CONV_TYPE IN ('Online Sales', 'Venue Manager')     THEN TICKETID END)  AS NEW_MEMBERS_ONLINE
         , COUNT(DISTINCT t.TICKETID)                                                                        AS NEW_MEMBERS_TOTAL
@@ -96,7 +98,7 @@ mbr_new AS (
 mbr_upgrades AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_UPGRADE))       AS MONTH_START
-        , f.SK_LOCATION                                                     AS SK_LOCATION
+        , f.SK_LOCATION_ACTIVE                                              AS SK_LOCATION
         , COUNT(DISTINCT t.TICKETID)                                        AS UPGRADES_TOTAL
     FROM mbr_facts_base f
     JOIN GOLD_DB.DW.DIMTICKET t USING(SK_TICKET)
@@ -108,7 +110,7 @@ mbr_upgrades AS (
 mbr_churn AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_TERMINATION))                           AS MONTH_START
-        , f.SK_LOCATION                                                                             AS SK_LOCATION
+        , f.SK_LOCATION_ACTIVE                                                                      AS SK_LOCATION
         -- Voluntary: member-initiated cancels; all non-payment reasons bucketed here so totals reconcile
         , SUM(CASE WHEN f.CANCEL_REASON NOT IN ('Payment Issue', 'Lapsed')
                     AND f.CANCEL_REASON IS NOT NULL THEN 1 ELSE 0 END)                              AS CHURN_VOLUNTARY
@@ -126,7 +128,7 @@ mbr_churn AS (
 mbr_churn_first_month AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))      AS MONTH_START
-        , f.SK_LOCATION                                                 AS SK_LOCATION
+        , f.SK_LOCATION_ACTIVE                                          AS SK_LOCATION
         , COUNT(*)                                                      AS CHURN_FIRST_MONTH
     FROM mbr_facts_base f
     WHERE f.SK_DATE_TERMINATION IS NOT NULL
@@ -139,7 +141,7 @@ mbr_churn_first_month AS (
 mbr_reactivated AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fm.SK_DATE))          AS MONTH_START
-        , lm.SK_LOCATION                                                AS SK_LOCATION
+        , lm.SK_LOCATION_ACTIVE                                         AS SK_LOCATION
         , COUNT(DISTINCT fm.SK_TICKET)                                  AS MEMBERS_REACTIVATED
     FROM GOLD_DB.CNS.TBL_FACTMEMBERSHIPPASSEVENTS fm
     JOIN location_map lm USING(SK_LOCATION)
@@ -153,7 +155,7 @@ mbr_reactivated AS (
 mbr_parent_addon AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', me.SK_DATE_JOIN))                     AS MONTH_START
-        , me.SK_LOCATION                                                                AS SK_LOCATION
+        , me.SK_LOCATION_ACTIVE                                                         AS SK_LOCATION
         , COUNT(DISTINCT t.TICKETID)                                                    AS PARENT_ADDONS
         , COUNT(DISTINCT CASE WHEN DATEDIFF(year, dc.BIRTHDATE, me.SK_DATE_JOIN) < 18
                                AND DATEDIFF(year, dc.BIRTHDATE, me.SK_DATE_JOIN) > 0
@@ -173,7 +175,7 @@ mbr_parent_addon AS (
 mbr_osat AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fr.SK_DATE_SURVEY))               AS MONTH_START
-        , lm.SK_LOCATION                                                            AS SK_LOCATION
+        , lm.SK_LOCATION_ACTIVE                                                     AS SK_LOCATION
         , COUNT(DISTINCT fr.SK_SURVEY)                                              AS OSAT_MEMBER_COUNT
         , COUNT(DISTINCT CASE WHEN fr.RESPONSENUMERIC = '5' THEN fr.SK_SURVEY END)  AS OSAT_5
         , COUNT(DISTINCT CASE WHEN fr.RESPONSENUMERIC = '4' THEN fr.SK_SURVEY END)  AS OSAT_4
@@ -257,3 +259,4 @@ LEFT JOIN mbr_osat o
 -- Only show months where the full calendar month is complete 
 WHERE pb.MONTH_START <= DATE_TRUNC('MONTH', CURRENT_DATE)
 ORDER BY pb.MONTH_START DESC
+;
