@@ -192,6 +192,52 @@ mbr_osat AS (
         AND qa.QUESTIONPROMPT ILIKE '%overall satisfaction%'
         AND qa.NUMERICCODE   <> '99'
     GROUP BY 1, 2
+),
+-- Recurring dues actually collected per park per month, bucketed by the month the payment was received.
+-- Uses SK_DATE_RECURR_LAST_PAY from TBL_FACTMEMBERSHIP_LASTEVENTS (last-event-per-ticket design), so this captures the most recent recurring payment on each membership.
+-- RECURRING_DUES_COLLECTED is an estimate: SUM(RECURR_AVG_DUES), which is the average dues amount across all payments on the membership — not the exact transaction amount.
+mbr_recurring_collected AS (
+    SELECT
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_RECURR_LAST_PAY))  AS MONTH_START
+        , f.SK_LOCATION_ACTIVE                                                  AS SK_LOCATION
+        , COUNT(DISTINCT f.SK_TICKET)                                           AS RECURRING_MEMBERS_BILLED
+        --UPDATE TO LAST_DUES
+        , SUM(f.RECURR_AVG_DUES)                                                AS RECURRING_DUES_COLLECTED
+    FROM mbr_facts_base f
+    WHERE f.SK_DATE_RECURR_LAST_PAY IS NOT NULL
+    GROUP BY 1, 2
+),
+-- Average duration (months) of members who churned in the reporting month. 
+-- CHURNED_DUR_WTAVG_DAYS_SUM and CHURNED_DUR_WTAVG_MEMBER_COUNT are the numerator/denominator components for wavg — only use when rolling up to region or district. Do NOT use either column as a standalone metric.
+mbr_avg_duration_churned AS (
+    SELECT
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_TERMINATION))  AS MONTH_START
+        , f.SK_LOCATION_ACTIVE                                              AS SK_LOCATION
+        , AVG(f.CANCEL_DAYS / 30.44)                                        AS AVG_DURATION_CHURNED_MONTHS
+        , SUM(f.CANCEL_DAYS)                                                AS CHURNED_DUR_WTAVG_DAYS_SUM
+        , COUNT(*)                                                          AS CHURNED_DUR_WTAVG_MEMBER_COUNT
+    FROM mbr_facts_base f
+    WHERE f.SK_DATE_TERMINATION IS NOT NULL
+      AND f.CANCEL_REASON <> 'Upgraded'
+    GROUP BY 1, 2
+),
+-- Rolling 12-month average duration of churned members. Pools the trailing 12 months of churn to smooth seasonal spikes — preferred for SPS forecasting.
+-- ROLLING12M_DUR_WTAVG_DAYS_SUM and ROLLING12M_DUR_WTAVG_MEMBER_COUNT aare the numerator/denominator components for wavg — only use these together (SUM/SUM) when rolling up to region or district. Do NOT use either column as a standalone metric.
+mbr_avg_duration_rolling12m AS (
+    SELECT
+          pb.MONTH_START
+        , pb.SK_LOCATION
+        , SUM(f.CANCEL_DAYS / 30.44)                                        AS AVG_DURATION_ROLLING_12M_MONTHS
+        , SUM(f.CANCEL_DAYS)                                                AS ROLLING12M_DUR_WTAVG_DAYS_SUM
+        , COUNT(*)                                                          AS ROLLING12M_DUR_WTAVG_MEMBER_COUNT
+    FROM parks_base pb
+    JOIN mbr_facts_base f
+        ON  f.SK_LOCATION_ACTIVE   = pb.SK_LOCATION
+        AND f.SK_DATE_TERMINATION  >= DATEADD('MONTH', -12, pb.MONTH_START)
+        AND f.SK_DATE_TERMINATION  <  pb.MONTH_START
+        AND f.SK_DATE_TERMINATION  IS NOT NULL
+        AND f.CANCEL_REASON        <> 'Upgraded'
+    GROUP BY 1, 2
 )
 
 SELECT
@@ -231,6 +277,22 @@ SELECT
     , o.OSAT_3::FLOAT AS OSAT_3
     , o.OSAT_2::FLOAT AS OSAT_2
     , o.OSAT_1::FLOAT AS OSAT_1
+    -- Recurring billing actually collected this month (based on SK_DATE_RECURR_LAST_PAY).
+    -- RECURRING_DUES_COLLECTED is approximate (SUM of avg dues); use TBL_FACTREVENUE for exact amounts.
+    -- Useful as a SPS (same park sales) input: recurring revenue base per park per month.
+    , rc.RECURRING_MEMBERS_BILLED::FLOAT AS RECURRING_MEMBERS_BILLED
+    , rc.RECURRING_DUES_COLLECTED::FLOAT AS RECURRING_DUES_COLLECTED
+    -- Approach A: avg duration of members who churned this month; use alongside CHURN_TOTAL as a quality signal.
+    -- Decreasing trend = early dropout problem; increasing trend = read with MEMBERS_ACTIVE to confirm direction.
+    , ad.AVG_DURATION_CHURNED_MONTHS::FLOAT AS AVG_DURATION_CHURNED_MONTHS
+    -- Weighted avg components for region/district rollup only — do NOT use as standalone metrics.
+    , ad.CHURNED_DUR_WTAVG_DAYS_SUM::FLOAT AS CHURNED_DUR_WTAVG_DAYS_SUM
+    , ad.CHURNED_DUR_WTAVG_MEMBER_COUNT::FLOAT AS CHURNED_DUR_WTAVG_MEMBER_COUNT
+    -- Approach D: rolling 12-month avg duration; smooths seasonal spikes; preferred SPS forecasting input.
+    , d12.AVG_DURATION_ROLLING_12M_MONTHS::FLOAT AS AVG_DURATION_ROLLING_12M_MONTHS
+    -- Weighted avg components for region/district rollup only — do NOT use as standalone metrics.
+    , d12.ROLLING12M_DUR_WTAVG_DAYS_SUM::FLOAT AS ROLLING12M_DUR_WTAVG_DAYS_SUM
+    , d12.ROLLING12M_DUR_WTAVG_MEMBER_COUNT::FLOAT AS ROLLING12M_DUR_WTAVG_MEMBER_COUNT
 FROM parks_base pb
 LEFT JOIN mbr_active am
     ON  am.SK_LOCATION = pb.SK_LOCATION
@@ -256,7 +318,16 @@ LEFT JOIN mbr_parent_addon pa
 LEFT JOIN mbr_osat o
     ON  o.SK_LOCATION = pb.SK_LOCATION
     AND o.MONTH_START = pb.MONTH_START
--- Only show months where the full calendar month is complete 
+LEFT JOIN mbr_recurring_collected rc
+    ON  rc.SK_LOCATION = pb.SK_LOCATION
+    AND rc.MONTH_START = pb.MONTH_START
+LEFT JOIN mbr_avg_duration_churned ad
+    ON  ad.SK_LOCATION = pb.SK_LOCATION
+    AND ad.MONTH_START = pb.MONTH_START
+LEFT JOIN mbr_avg_duration_rolling12m d12
+    ON  d12.SK_LOCATION = pb.SK_LOCATION
+    AND d12.MONTH_START = pb.MONTH_START
+-- Only show months where the full calendar month is complete
 WHERE pb.MONTH_START <= DATE_TRUNC('MONTH', CURRENT_DATE)
 ORDER BY pb.MONTH_START DESC
 ;
