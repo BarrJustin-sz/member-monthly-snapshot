@@ -1,7 +1,5 @@
 
--- Each row in this output represents a calendar month's performance by park, labeled by the LAST DAY of that month
--- (e.g., the row dated 2026-04-30 summarizes active members at end of April and all activity that occurred during April 2026).
--- Internally, CTEs shift MONTH_START forward by one month (+1) and SK_DATE_RECORD is then output as DATEADD(DAY, -1, MONTH_START) to relabel it as end of the month.
+
 WITH
 -- Maps all historical SK_LOCATIONs for the target park to the current surrogate key.
 -- Prevents duplicate months when a new SCD2 row is minted for a park mid-month.
@@ -52,6 +50,8 @@ mbr_facts_base AS (
     JOIN location_map lm USING(SK_LOCATION)
 ),
 -- Base: park x month from revenue, sum pre-calculated potentials split by booking channel
+-- Each row in this output represents a calendar month's performance by park, labeled by the LAST DAY of that month (e.g., the row dated 2026-04-30 summarizes active members at end of April and all activity that occurred during April 2026).
+-- DATE CONVENTION: Event dates are bucketed as DATEADD('MONTH', 1, DATE_TRUNC('MONTH', <event_date>)) to shift MONTH_START forward by one month (+1) and the final select then outputs as DATEADD(DAY, -1, MONTH_START) to relabel it as the last day of the month. (e.g., internal May 1 → output April 30).
 parks_base AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fr.SK_DATE_RECORD))                                                           AS MONTH_START
@@ -124,7 +124,6 @@ mbr_churn AS (
 ),
 -- First-month churn attributed to the JOIN month, not the termination month.
 -- Counts members who churned within 33 days of joining, bucketed by when they signed up.
--- A Feb 21 joiner who cancels Mar 5 counts in February here.
 mbr_churn_first_month AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))      AS MONTH_START
@@ -193,15 +192,49 @@ mbr_osat AS (
         AND qa.NUMERICCODE   <> '99'
     GROUP BY 1, 2
 ),
+-- Booking-level sock attachment for new-member bookings only.
+-- TICKETQUANTITY > 0 excludes Roller's zero-qty revenue split rows and refund/reversal rows.
+-- SOCK_QTY_CAPPED: socks capped at membership qty per booking (e.g. 2 members + 3 socks = 2).
+sock_booking_bridge AS (
+    SELECT
+          f.SK_BOOKING
+        , LEAST(
+            NVL(s.SOCK_QTY_RAW, 0),
+            COUNT(DISTINCT f.SK_TICKET)
+          )  AS SOCK_QTY_CAPPED
+    FROM mbr_facts_base f
+    LEFT JOIN (
+        SELECT
+              fr.SK_BOOKING
+            , SUM(fr.TICKETQUANTITY)  AS SOCK_QTY_RAW
+        FROM GOLD_DB.CNS.TBL_FACTREVENUE fr
+        JOIN GOLD_DB.CNS.TBL_DIMPRODUCT p
+            ON  p.SK_PRODUCT     = fr.SK_PRODUCT
+            AND p.HOLYGRAILGROUP = 'Socks'
+        WHERE fr.TICKETQUANTITY > 0
+        GROUP BY fr.SK_BOOKING
+    ) s ON s.SK_BOOKING = f.SK_BOOKING
+    WHERE f.SK_DATE_JOIN IS NOT NULL
+    GROUP BY f.SK_BOOKING, s.SOCK_QTY_RAW
+),
+-- Booking-level sock attach rate rolled up to park x month.
+mbr_socks AS (
+    SELECT
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))   AS MONTH_START
+        , f.SK_LOCATION_ACTIVE                                       AS SK_LOCATION
+        , SUM(sb.SOCK_QTY_CAPPED)                                    AS SOCKS_W_MBR_CAPPED
+    FROM mbr_facts_base f
+    JOIN sock_booking_bridge sb ON sb.SK_BOOKING = f.SK_BOOKING
+    WHERE f.SK_DATE_JOIN IS NOT NULL
+    GROUP BY 1, 2
+),
 -- Recurring dues actually collected per park per month, bucketed by the month the payment was received.
--- Uses SK_DATE_RECURR_LAST_PAY from TBL_FACTMEMBERSHIP_LASTEVENTS (last-event-per-ticket design), so this captures the most recent recurring payment on each membership.
--- RECURRING_DUES_COLLECTED is an estimate: SUM(RECURR_AVG_DUES), which is the average dues amount across all payments on the membership — not the exact transaction amount.
 mbr_recurring_collected AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_RECURR_LAST_PAY))  AS MONTH_START
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_RECURR_LAST_PAY))   AS MONTH_START
         , f.SK_LOCATION_ACTIVE                                                  AS SK_LOCATION
         , COUNT(DISTINCT f.SK_TICKET)                                           AS RECURRING_MEMBERS_BILLED
-        --UPDATE TO LAST_DUES
+        --BUG FIX: Update TO RECURR_LAST_DUES when available in FACTMEMBERSHIP_LASTEVENTS
         , SUM(f.RECURR_AVG_DUES)                                                AS RECURRING_DUES_COLLECTED
     FROM mbr_facts_base f
     WHERE f.SK_DATE_RECURR_LAST_PAY IS NOT NULL
@@ -211,7 +244,7 @@ mbr_recurring_collected AS (
 -- CHURNED_DUR_WTAVG_DAYS_SUM and CHURNED_DUR_WTAVG_MEMBER_COUNT are the numerator/denominator components for wavg — only use when rolling up to region or district. Do NOT use either column as a standalone metric.
 mbr_avg_duration_churned AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_TERMINATION))  AS MONTH_START
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_TERMINATION))   AS MONTH_START
         , f.SK_LOCATION_ACTIVE                                              AS SK_LOCATION
         , AVG(f.CANCEL_DAYS / 30.44)                                        AS AVG_DURATION_CHURNED_MONTHS
         , SUM(f.CANCEL_DAYS)                                                AS CHURNED_DUR_WTAVG_DAYS_SUM
@@ -222,7 +255,7 @@ mbr_avg_duration_churned AS (
     GROUP BY 1, 2
 ),
 -- Rolling 12-month average duration of churned members. Pools the trailing 12 months of churn to smooth seasonal spikes — preferred for SPS forecasting.
--- ROLLING12M_DUR_WTAVG_DAYS_SUM and ROLLING12M_DUR_WTAVG_MEMBER_COUNT aare the numerator/denominator components for wavg — only use these together (SUM/SUM) when rolling up to region or district. Do NOT use either column as a standalone metric.
+-- ROLLING12M_DUR_WTAVG_DAYS_SUM and ROLLING12M_DUR_WTAVG_MEMBER_COUNT aare the numerator/denominator components for wavg — only use these together when rolling up to region or district. Do NOT use either column as a standalone metric.
 mbr_avg_duration_rolling12m AS (
     SELECT
           pb.MONTH_START
@@ -242,7 +275,7 @@ mbr_avg_duration_rolling12m AS (
 
 SELECT
       DATEADD('DAY', -1, pb.MONTH_START)::DATE AS SK_DATE_RECORD  --> Last day of the reporting month; joins to GOLD_DB.DW.DIMDATE in AAS
-    , pb.SK_LOCATION::INT AS SK_LOCATION                        --> To join with GOLD_DB.CNS.TBL_DIMLOCATION in AAS (always current SK)
+    , pb.SK_LOCATION::INT AS SK_LOCATION                          --> To join with GOLD_DB.CNS.TBL_DIMLOCATION in AAS (always current SK)
     , am.ACTIVE_MEMBERS::FLOAT AS MEMBERS_ACTIVE
     , pb.POTENTIALS_TOTAL::FLOAT AS POTENTIALS_TOTAL
     , pb.POTENTIALS_INPARK::FLOAT AS POTENTIALS_INPARK
@@ -264,10 +297,6 @@ SELECT
            THEN cfm.CHURN_FIRST_MONTH
            ELSE NULL
       END::FLOAT AS CHURN_FIRST_MONTH
-    -- Reactivations are excluded: TBL_FACTMEMBERSHIP_LASTEVENTS stores last-event-per-ticket,
-    -- so reactivated members already appear in the active count (their SK_DATE_TERMINATION is
-    -- updated to a future date) and were never subtracted via CHURN_TOTAL. Adding REACTIVATED
-    -- here would double-count them. Formula reconciles to actual active delta within ~20 members/month.
     , (NVL(nm.NEW_MEMBERS_TOTAL,0)
         - NVL(u.UPGRADES_TOTAL,0)
         - NVL(c.CHURN_TOTAL,0))::FLOAT AS MEMBERS_NET_CHANGE
@@ -277,22 +306,19 @@ SELECT
     , o.OSAT_3::FLOAT AS OSAT_3
     , o.OSAT_2::FLOAT AS OSAT_2
     , o.OSAT_1::FLOAT AS OSAT_1
-    -- Recurring billing actually collected this month (based on SK_DATE_RECURR_LAST_PAY).
-    -- RECURRING_DUES_COLLECTED is approximate (SUM of avg dues); use TBL_FACTREVENUE for exact amounts.
-    -- Useful as a SPS (same park sales) input: recurring revenue base per park per month.
+    , sk.SOCKS_W_MBR_CAPPED::FLOAT AS SOCKS_W_MBR_CAPPED
+    -- Sock attach rate: capped sock qty / new members total (nm.NEW_MEMBERS_TOTAL, consistent denominator)
+    , (sk.SOCKS_W_MBR_CAPPED / NULLIF(nm.NEW_MEMBERS_TOTAL, 0))::FLOAT AS SOCK_ATTACH_RATE
     , rc.RECURRING_MEMBERS_BILLED::FLOAT AS RECURRING_MEMBERS_BILLED
     , rc.RECURRING_DUES_COLLECTED::FLOAT AS RECURRING_DUES_COLLECTED
-    -- Approach A: avg duration of members who churned this month; use alongside CHURN_TOTAL as a quality signal.
-    -- Decreasing trend = early dropout problem; increasing trend = read with MEMBERS_ACTIVE to confirm direction.
-    , ad.AVG_DURATION_CHURNED_MONTHS::FLOAT AS AVG_DURATION_CHURNED_MONTHS
+    , ad.AVG_DURATION_CHURNED_MONTHS::FLOAT AS DURATION_CHURNED_AVG_MONTHS
     -- Weighted avg components for region/district rollup only — do NOT use as standalone metrics.
-    , ad.CHURNED_DUR_WTAVG_DAYS_SUM::FLOAT AS CHURNED_DUR_WTAVG_DAYS_SUM
-    , ad.CHURNED_DUR_WTAVG_MEMBER_COUNT::FLOAT AS CHURNED_DUR_WTAVG_MEMBER_COUNT
-    -- Approach D: rolling 12-month avg duration; smooths seasonal spikes; preferred SPS forecasting input.
-    , d12.AVG_DURATION_ROLLING_12M_MONTHS::FLOAT AS AVG_DURATION_ROLLING_12M_MONTHS
+    , ad.CHURNED_DUR_WTAVG_DAYS_SUM::FLOAT AS DUR_CHURNED_WTAVG_DAYS_SUM
+    , ad.CHURNED_DUR_WTAVG_MEMBER_COUNT::FLOAT AS DUR_CHURNED_WTAVG_MEMBER_COUNT
+    , d12.AVG_DURATION_ROLLING_12M_MONTHS::FLOAT AS DURATION_AVG_ROLLING_12M
     -- Weighted avg components for region/district rollup only — do NOT use as standalone metrics.
-    , d12.ROLLING12M_DUR_WTAVG_DAYS_SUM::FLOAT AS ROLLING12M_DUR_WTAVG_DAYS_SUM
-    , d12.ROLLING12M_DUR_WTAVG_MEMBER_COUNT::FLOAT AS ROLLING12M_DUR_WTAVG_MEMBER_COUNT
+    , d12.ROLLING12M_DUR_WTAVG_DAYS_SUM::FLOAT AS DUR_WTAVG_ROLLING12M_DAYS_SUM
+    , d12.ROLLING12M_DUR_WTAVG_MEMBER_COUNT::FLOAT AS DUR_WTAVG_ROLLING12M_MEMBER_COUNT
 FROM parks_base pb
 LEFT JOIN mbr_active am
     ON  am.SK_LOCATION = pb.SK_LOCATION
@@ -318,6 +344,9 @@ LEFT JOIN mbr_parent_addon pa
 LEFT JOIN mbr_osat o
     ON  o.SK_LOCATION = pb.SK_LOCATION
     AND o.MONTH_START = pb.MONTH_START
+LEFT JOIN mbr_socks sk
+    ON  sk.SK_LOCATION = pb.SK_LOCATION
+    AND sk.MONTH_START = pb.MONTH_START
 LEFT JOIN mbr_recurring_collected rc
     ON  rc.SK_LOCATION = pb.SK_LOCATION
     AND rc.MONTH_START = pb.MONTH_START
