@@ -194,7 +194,7 @@ mbr_osat AS (
 ),
 -- Booking-level sock attachment for new-member bookings only.
 -- TICKETQUANTITY > 0 excludes Roller's zero-qty revenue split rows and refund/reversal rows.
--- SOCK_QTY_CAPPED: socks capped at membership qty per booking (e.g. 2 members + 3 socks = 2).
+-- SOCK_QTY_CAPPED: socks capped at membership qty per booking (e.g. 2 members + 3 socks = 2 socks capped).
 sock_booking_bridge AS (
     SELECT
           f.SK_BOOKING
@@ -246,7 +246,7 @@ mbr_avg_duration_churned AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_TERMINATION))   AS MONTH_START
         , f.SK_LOCATION_ACTIVE                                              AS SK_LOCATION
-        , AVG(f.CANCEL_DAYS / 30.44)                                        AS AVG_DURATION_CHURNED_MONTHS
+        , ROUND(AVG(f.CANCEL_DAYS / 30.44), 2)                              AS AVG_DURATION_CHURNED_MONTHS
         , SUM(f.CANCEL_DAYS)                                                AS CHURNED_DUR_WTAVG_DAYS_SUM
         , COUNT(*)                                                          AS CHURNED_DUR_WTAVG_MEMBER_COUNT
     FROM mbr_facts_base f
@@ -260,7 +260,7 @@ mbr_avg_duration_rolling12m AS (
     SELECT
           pb.MONTH_START
         , pb.SK_LOCATION
-        , SUM(f.CANCEL_DAYS / 30.44)                                        AS AVG_DURATION_ROLLING_12M_MONTHS
+        , ROUND(SUM(f.CANCEL_DAYS / 30.44), 2)                              AS AVG_DURATION_ROLLING_12M_MONTHS
         , SUM(f.CANCEL_DAYS)                                                AS ROLLING12M_DUR_WTAVG_DAYS_SUM
         , COUNT(*)                                                          AS ROLLING12M_DUR_WTAVG_MEMBER_COUNT
     FROM parks_base pb
