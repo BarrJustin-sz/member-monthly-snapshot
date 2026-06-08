@@ -240,18 +240,22 @@ mbr_socks AS (
     )
     GROUP BY 1, 2
 ),
--- Recurring dues net collected per park per month (USD), bucketed by the month the payment was received.
--- Refunds are included so the result is net collected (gross payments minus refunded payments).
+-- Recurring dues collected per park per month (USD), matching the comp/AZ view logic.
+-- Sources from TBL_FACTREVENUE filtered to TRANSACTIONLOCATION ILIKE '%recurring%' (= 'Recurring billing'),
+-- summing MEMBERSHIP_REVENUE — the CNS-recognized revenue field, consistent with COMP_REVENUE_RECURRING_MEMBERSHIP_CY.
+-- This excludes non-recurring channels (POS new sales, online, venue manager refunds) and aligns to
+-- the same revenue recognition treatment used across all other membership revenue reporting.
 mbr_recurring_collected AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fm.SK_DATE))                  AS MONTH_START
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fr.SK_DATE_RECORD))           AS MONTH_START
         , lm.SK_LOCATION_ACTIVE                                                 AS SK_LOCATION
-        , COUNT(DISTINCT fm.SK_TICKET)                                          AS RECURRING_MEMBERS_BILLED
-        , SUM(fm.VALUE_USD)                                                     AS RECURRING_DUES_COLLECTED
-    FROM GOLD_DB.CNS.TBL_FACTMEMBERSHIPPASSEVENTS fm
+        , COUNT(DISTINCT fr.SK_TICKET)                                          AS RECURRING_MEMBERS_BILLED
+        , SUM(fr.MEMBERSHIP_REVENUE)                                            AS RECURRING_DUES_COLLECTED
+    FROM GOLD_DB.CNS.TBL_FACTREVENUE fr
     JOIN location_map lm USING(SK_LOCATION)
-    JOIN GOLD_DB.DW.DIMMEMBERSHIPPASSEVENT dm USING(SK_EVENTTYPE)
-    WHERE dm.EVENTTYPE = 'Recurring Payment'
+    LEFT JOIN GOLD_DB.DW.DIMTRANSACTIONPAYMENTLABEL tpl
+        ON tpl.SK_TRANSACTIONPAYMENTLABEL = fr.SK_TRANSACTIONPAYMENTLABEL
+    WHERE tpl.TRANSACTIONLOCATION ILIKE '%recurring%'
     GROUP BY 1, 2
 ),
 -- Average duration (months) of members who churned in the reporting month. 
