@@ -217,9 +217,9 @@ sock_booking_bridge AS (
     GROUP BY f.SK_BOOKING, s.SOCK_QTY_RAW
 ),
 -- Booking-level sock attach rate rolled up to park x month.
--- SOCKS_W_MBR_CAPPED_INPARK excludes online bookings where socks are optional (attach rate ~2% vs ~24% in-park).
--- Cap is applied at booking+month+location granularity so only tickets joining in that month are counted,
--- preventing inflation from historical members on the same booking.
+-- SOCKS_W_MBR_CAPPED_INPARK excludes online bookings where socks are optional.
+-- Cap is applied at booking level so there cant be more socks sold than memberships if there are multiple products on the same transaction. 
+-- Known gap || If there are multiple products on the same transaction, we can't determine if the socks are being attached to the member or ticket.
 mbr_socks AS (
     SELECT
           MONTH_START
@@ -241,8 +241,6 @@ mbr_socks AS (
     GROUP BY 1, 2
 ),
 -- Recurring dues net collected per park per month (USD), bucketed by the month the payment was received.
--- Sources from TBL_FACTMEMBERSHIPPASSEVENTS (one row per billing event) — not the last-events table,
--- which only stores the most recent pay date and inflates the current month.
 -- Refunds are included so the result is net collected (gross payments minus refunded payments).
 mbr_recurring_collected AS (
     SELECT
