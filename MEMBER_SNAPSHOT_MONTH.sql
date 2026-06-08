@@ -195,13 +195,12 @@ mbr_osat AS (
 -- Booking-level sock attachment for new-member bookings only.
 -- TICKETQUANTITY > 0 excludes Roller's zero-qty revenue split rows and refund/reversal rows.
 -- SOCK_QTY_CAPPED: socks capped at membership qty per booking (e.g. 2 members + 3 socks = 2 socks capped).
+-- IS_INPARK: 1 if any ticket on the booking was sold in-park (CONV_TYPE not Online/Venue Manager).
 sock_booking_bridge AS (
     SELECT
           f.SK_BOOKING
-        , LEAST(
-            NVL(s.SOCK_QTY_RAW, 0),
-            COUNT(DISTINCT f.SK_TICKET)
-          )  AS SOCK_QTY_CAPPED
+        , NVL(s.SOCK_QTY_RAW, 0)                                                                AS SOCK_QTY_RAW
+        , MAX(CASE WHEN f.CONV_TYPE NOT IN ('Online Sales', 'Venue Manager') THEN 1 ELSE 0 END) AS IS_INPARK
     FROM mbr_facts_base f
     LEFT JOIN (
         SELECT
@@ -218,26 +217,43 @@ sock_booking_bridge AS (
     GROUP BY f.SK_BOOKING, s.SOCK_QTY_RAW
 ),
 -- Booking-level sock attach rate rolled up to park x month.
+-- SOCKS_W_MBR_CAPPED_INPARK excludes online bookings where socks are optional (attach rate ~2% vs ~24% in-park).
+-- Cap is applied at booking+month+location granularity so only tickets joining in that month are counted,
+-- preventing inflation from historical members on the same booking.
 mbr_socks AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))   AS MONTH_START
-        , f.SK_LOCATION_ACTIVE                                       AS SK_LOCATION
-        , SUM(sb.SOCK_QTY_CAPPED)                                    AS SOCKS_W_MBR_CAPPED
-    FROM mbr_facts_base f
-    JOIN sock_booking_bridge sb ON sb.SK_BOOKING = f.SK_BOOKING
-    WHERE f.SK_DATE_JOIN IS NOT NULL
+          MONTH_START
+        , SK_LOCATION
+        , SUM(SOCK_QTY_CAPPED)                                                  AS SOCKS_W_MBR_CAPPED
+        , SUM(CASE WHEN IS_INPARK = 1 THEN SOCK_QTY_CAPPED ELSE 0 END)         AS SOCKS_W_MBR_CAPPED_INPARK
+    FROM (
+        SELECT
+              DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))          AS MONTH_START
+            , f.SK_LOCATION_ACTIVE                                              AS SK_LOCATION
+            , f.SK_BOOKING
+            , sb.IS_INPARK
+            , LEAST(sb.SOCK_QTY_RAW, COUNT(DISTINCT f.SK_TICKET))              AS SOCK_QTY_CAPPED
+        FROM mbr_facts_base f
+        JOIN sock_booking_bridge sb ON sb.SK_BOOKING = f.SK_BOOKING
+        WHERE f.SK_DATE_JOIN IS NOT NULL
+        GROUP BY 1, 2, f.SK_BOOKING, sb.SOCK_QTY_RAW, sb.IS_INPARK
+    )
     GROUP BY 1, 2
 ),
--- Recurring dues actually collected per park per month, bucketed by the month the payment was received.
+-- Recurring dues net collected per park per month (USD), bucketed by the month the payment was received.
+-- Sources from TBL_FACTMEMBERSHIPPASSEVENTS (one row per billing event) — not the last-events table,
+-- which only stores the most recent pay date and inflates the current month.
+-- Refunds are included so the result is net collected (gross payments minus refunded payments).
 mbr_recurring_collected AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_RECURR_LAST_PAY))   AS MONTH_START
-        , f.SK_LOCATION_ACTIVE                                                  AS SK_LOCATION
-        , COUNT(DISTINCT f.SK_TICKET)                                           AS RECURRING_MEMBERS_BILLED
-        --BUG FIX: Update TO RECURR_LAST_DUES when available in FACTMEMBERSHIP_LASTEVENTS
-        , SUM(f.RECURR_AVG_DUES)                                                AS RECURRING_DUES_COLLECTED
-    FROM mbr_facts_base f
-    WHERE f.SK_DATE_RECURR_LAST_PAY IS NOT NULL
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fm.SK_DATE))                  AS MONTH_START
+        , lm.SK_LOCATION_ACTIVE                                                 AS SK_LOCATION
+        , COUNT(DISTINCT fm.SK_TICKET)                                          AS RECURRING_MEMBERS_BILLED
+        , SUM(fm.VALUE_USD)                                                     AS RECURRING_DUES_COLLECTED
+    FROM GOLD_DB.CNS.TBL_FACTMEMBERSHIPPASSEVENTS fm
+    JOIN location_map lm USING(SK_LOCATION)
+    JOIN GOLD_DB.DW.DIMMEMBERSHIPPASSEVENT dm USING(SK_EVENTTYPE)
+    WHERE dm.EVENTTYPE = 'Recurring Payment'
     GROUP BY 1, 2
 ),
 -- Average duration (months) of members who churned in the reporting month. 
@@ -307,8 +323,11 @@ SELECT
     , o.OSAT_2::FLOAT AS OSAT_2
     , o.OSAT_1::FLOAT AS OSAT_1
     , sk.SOCKS_W_MBR_CAPPED::FLOAT AS SOCKS_W_MBR_CAPPED
-    -- Sock attach rate: capped sock qty / new members total (nm.NEW_MEMBERS_TOTAL, consistent denominator)
+    -- Blended attach rate (all channels); use SOCK_ATTACH_RATE_INPARK for operational performance tracking
     , (sk.SOCKS_W_MBR_CAPPED / NULLIF(nm.NEW_MEMBERS_TOTAL, 0))::FLOAT AS SOCK_ATTACH_RATE
+    , sk.SOCKS_W_MBR_CAPPED_INPARK::FLOAT AS SOCKS_W_MBR_CAPPED_INPARK
+    -- In-park only attach rate: socks are mandatory in-park; online is ~2% (optional) and dilutes the metric
+    , (sk.SOCKS_W_MBR_CAPPED_INPARK / NULLIF(nm.NEW_MEMBERS_INPARK, 0))::FLOAT AS SOCK_ATTACH_RATE_INPARK
     , rc.RECURRING_MEMBERS_BILLED::FLOAT AS RECURRING_MEMBERS_BILLED
     , rc.RECURRING_DUES_COLLECTED::FLOAT AS RECURRING_DUES_COLLECTED
     , ad.AVG_DURATION_CHURNED_MONTHS::FLOAT AS DURATION_CHURNED_AVG_MONTHS
