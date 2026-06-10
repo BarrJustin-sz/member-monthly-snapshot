@@ -84,55 +84,53 @@ mbr_active AS (
 -- CONV_TYPE values: 'In Store', 'Online Sales', 'Data Import', 'Venue Manager', NULL
 mbr_new AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))                                          AS MONTH_START
-        , f.SK_LOCATION_ACTIVE                                                                              AS SK_LOCATION
-        , COUNT(DISTINCT CASE WHEN f.CONV_TYPE NOT IN ('Online Sales', 'Venue Manager') THEN TICKETID END)  AS NEW_MEMBERS_INPARK
-        , COUNT(DISTINCT CASE WHEN f.CONV_TYPE IN ('Online Sales', 'Venue Manager')     THEN TICKETID END)  AS NEW_MEMBERS_ONLINE
-        , COUNT(DISTINCT t.TICKETID)                                                                        AS NEW_MEMBERS_TOTAL
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', SK_DATE_JOIN))                                          AS MONTH_START
+        , SK_LOCATION_ACTIVE                                                                              AS SK_LOCATION
+        , COUNT(DISTINCT CASE WHEN CONV_TYPE NOT IN ('Online Sales', 'Venue Manager') THEN SK_TICKET END) AS NEW_MEMBERS_INPARK
+        , COUNT(DISTINCT CASE WHEN CONV_TYPE IN ('Online Sales', 'Venue Manager')     THEN SK_TICKET END) AS NEW_MEMBERS_ONLINE
+        , COUNT(DISTINCT SK_TICKET)                                                                       AS NEW_MEMBERS_TOTAL
     FROM mbr_facts_base f
-    JOIN GOLD_DB.DW.DIMTICKET t USING(SK_TICKET)
-    WHERE f.SK_DATE_JOIN IS NOT NULL
+    WHERE SK_DATE_JOIN IS NOT NULL
     GROUP BY 1, 2
 ),
 -- Upgrades per park per month (by upgrade date)
 mbr_upgrades AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_UPGRADE))       AS MONTH_START
-        , f.SK_LOCATION_ACTIVE                                              AS SK_LOCATION
-        , COUNT(DISTINCT t.TICKETID)                                        AS UPGRADES_TOTAL
-    FROM mbr_facts_base f
-    JOIN GOLD_DB.DW.DIMTICKET t USING(SK_TICKET)
-    WHERE f.CANCEL_REASON = 'Upgraded'
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', SK_DATE_UPGRADE))       AS MONTH_START
+        , SK_LOCATION_ACTIVE                                              AS SK_LOCATION
+        , COUNT(DISTINCT SK_TICKET)                                       AS UPGRADES_TOTAL
+    FROM mbr_facts_base 
+    WHERE CANCEL_REASON = 'Upgraded'
     GROUP BY 1, 2
 ),
 -- Churn broken out by reason, per park per month (by termination month); excludes upgrades
 -- BUG FIX: Voluntary includes ('Cancel Requested', 'Refund', 'Cancel Assumed') and the legacy 'Term Roller'
 mbr_churn AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_TERMINATION))                           AS MONTH_START
-        , f.SK_LOCATION_ACTIVE                                                                      AS SK_LOCATION
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', SK_DATE_TERMINATION))                           AS MONTH_START
+        , SK_LOCATION_ACTIVE                                                                      AS SK_LOCATION
         -- Voluntary: member-initiated cancels; all non-payment reasons bucketed here so totals reconcile
-        , SUM(CASE WHEN f.CANCEL_REASON NOT IN ('Payment Issue', 'Lapsed')
-                    AND f.CANCEL_REASON IS NOT NULL THEN 1 ELSE 0 END)                              AS CHURN_VOLUNTARY
+        , SUM(CASE WHEN CANCEL_REASON NOT IN ('Payment Issue', 'Lapsed')
+                    AND CANCEL_REASON IS NOT NULL THEN 1 ELSE 0 END)                              AS CHURN_VOLUNTARY
         -- Involuntary: billing failure or lapse due to non-payment
-        , SUM(CASE WHEN f.CANCEL_REASON IN ('Payment Issue', 'Lapsed') THEN 1 ELSE 0 END)           AS CHURN_INVOLUNTARY
-        , COUNT(*)                                                                                  AS CHURN_TOTAL
-    FROM mbr_facts_base f
-    WHERE f.SK_DATE_TERMINATION IS NOT NULL
-      AND f.CANCEL_REASON <> 'Upgraded'
+        , SUM(CASE WHEN CANCEL_REASON IN ('Payment Issue', 'Lapsed') THEN 1 ELSE 0 END)           AS CHURN_INVOLUNTARY
+        , COUNT(DISTINCT SK_TICKET)                                                               AS CHURN_TOTAL
+    FROM mbr_facts_base 
+    WHERE SK_DATE_TERMINATION IS NOT NULL
+      AND CANCEL_REASON <> 'Upgraded'
     GROUP BY 1, 2
 ),
 -- First-month churn attributed to the JOIN month, not the termination month.
 -- Counts members who churned within 33 days of joining, bucketed by when they signed up.
 mbr_churn_first_month AS (
     SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_JOIN))      AS MONTH_START
-        , f.SK_LOCATION_ACTIVE                                          AS SK_LOCATION
-        , COUNT(*)                                                      AS CHURN_FIRST_MONTH
-    FROM mbr_facts_base f
-    WHERE f.SK_DATE_TERMINATION IS NOT NULL
-      AND f.CANCEL_REASON <> 'Upgraded'
-      AND f.CANCEL_DAYS <= 33
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', SK_DATE_JOIN))      AS MONTH_START
+        , SK_LOCATION_ACTIVE                                          AS SK_LOCATION
+        , COUNT(DISTINCT SK_TICKET)                                   AS CHURN_FIRST_MONTH
+    FROM mbr_facts_base 
+    WHERE SK_DATE_TERMINATION IS NOT NULL
+      AND CANCEL_REASON <> 'Upgraded'
+      AND CANCEL_DAYS <= 33
     GROUP BY 1, 2
 ),
 -- Reactivated members per park per month
@@ -155,12 +153,11 @@ mbr_parent_addon AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', me.SK_DATE_JOIN))                     AS MONTH_START
         , me.SK_LOCATION_ACTIVE                                                         AS SK_LOCATION
-        , COUNT(DISTINCT t.TICKETID)                                                    AS PARENT_ADDONS
+        , COUNT(DISTINCT me.SK_TICKET)                                                  AS PARENT_ADDONS
         , COUNT(DISTINCT CASE WHEN DATEDIFF(year, dc.BIRTHDATE, me.SK_DATE_JOIN) < 18
                                AND DATEDIFF(year, dc.BIRTHDATE, me.SK_DATE_JOIN) > 0
-                              THEN t.TICKETID END)                                      AS PARENT_ADDONS_UNDER18
+                              THEN me.SK_TICKET END)                                    AS PARENT_ADDONS_UNDER18
     FROM mbr_facts_base me
-    JOIN GOLD_DB.DW.DIMTICKET t USING(SK_TICKET)
     JOIN GOLD_DB.CNS.TBL_DIMPRODUCT p USING(SK_PRODUCT)
     LEFT JOIN GOLD_DB.DW.DIMCUSTOMER dc
         ON  dc.SK_CUSTOMER     = me.SK_JUMPERCUSTOMER
@@ -240,11 +237,7 @@ mbr_socks AS (
     )
     GROUP BY 1, 2
 ),
--- Recurring dues collected per park per month (USD), matching the comp/AZ view logic.
--- Sources from TBL_FACTREVENUE filtered to TRANSACTIONLOCATION ILIKE '%recurring%' (= 'Recurring billing'),
--- summing MEMBERSHIP_REVENUE — the CNS-recognized revenue field, consistent with COMP_REVENUE_RECURRING_MEMBERSHIP_CY.
--- This excludes non-recurring channels (POS new sales, online, venue manager refunds) and aligns to
--- the same revenue recognition treatment used across all other membership revenue reporting.
+-- Recurring dues collected per park per month, from TBL_FACTREVENUE filtered to TRANSACTIONLOCATION ILIKE '%recurring%' (='Recurring billing') consistent with COMPPARK_AZ logic.
 mbr_recurring_collected AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fr.SK_DATE_RECORD))           AS MONTH_START
@@ -266,7 +259,7 @@ mbr_avg_duration_churned AS (
         , f.SK_LOCATION_ACTIVE                                              AS SK_LOCATION
         , ROUND(AVG(f.CANCEL_DAYS / 30.44), 2)                              AS AVG_DURATION_CHURNED_MONTHS
         , SUM(f.CANCEL_DAYS)                                                AS CHURNED_DUR_WTAVG_DAYS_SUM
-        , COUNT(*)                                                          AS CHURNED_DUR_WTAVG_MEMBER_COUNT
+        , COUNT(DISTINCT f.SK_TICKET)                                       AS CHURNED_DUR_WTAVG_MEMBER_COUNT
     FROM mbr_facts_base f
     WHERE f.SK_DATE_TERMINATION IS NOT NULL
       AND f.CANCEL_REASON <> 'Upgraded'
@@ -278,9 +271,9 @@ mbr_avg_duration_rolling12m AS (
     SELECT
           pb.MONTH_START
         , pb.SK_LOCATION
-        , ROUND(SUM(f.CANCEL_DAYS / 30.44), 2)                              AS AVG_DURATION_ROLLING_12M_MONTHS
+        , ROUND(AVG(f.CANCEL_DAYS / 30.44), 2)                              AS AVG_DURATION_ROLLING_12M_MONTHS
         , SUM(f.CANCEL_DAYS)                                                AS ROLLING12M_DUR_WTAVG_DAYS_SUM
-        , COUNT(*)                                                          AS ROLLING12M_DUR_WTAVG_MEMBER_COUNT
+        , COUNT(DISTINCT f.SK_TICKET)                                       AS ROLLING12M_DUR_WTAVG_MEMBER_COUNT
     FROM parks_base pb
     JOIN mbr_facts_base f
         ON  f.SK_LOCATION_ACTIVE   = pb.SK_LOCATION
@@ -302,7 +295,7 @@ SELECT
     , nm.NEW_MEMBERS_INPARK::FLOAT AS NEW_MEMBERS_INPARK
     , nm.NEW_MEMBERS_ONLINE::FLOAT AS NEW_MEMBERS_ONLINE
     , u.UPGRADES_TOTAL::FLOAT AS UPGRADES_TOTAL
-    -- True new sales: new members minus upgrade child tickets (child ticket joins in same month as upgrade)
+    -- True new members: new members minus upgrade child tickets (child ticket joins in same month as upgrade)
     , (NVL(nm.NEW_MEMBERS_TOTAL,0) - NVL(u.UPGRADES_TOTAL,0))::FLOAT AS NEW_MEMBERS_EXCL_UPGRADES
     , pa.PARENT_ADDONS::FLOAT AS NEW_MEMBERS_PARENT_ADDONS
     , pa.PARENT_ADDONS_UNDER18::FLOAT AS PARENT_ADDONS_UNDER18
@@ -325,10 +318,7 @@ SELECT
     , o.OSAT_2::FLOAT AS OSAT_2
     , o.OSAT_1::FLOAT AS OSAT_1
     , sk.SOCKS_W_MBR_CAPPED::FLOAT AS SOCKS_W_MBR_CAPPED
-    -- Blended attach rate (all channels); use SOCK_ATTACH_RATE_INPARK for operational performance tracking
-    , (sk.SOCKS_W_MBR_CAPPED / NULLIF(nm.NEW_MEMBERS_TOTAL, 0))::FLOAT AS SOCK_ATTACH_RATE
     , sk.SOCKS_W_MBR_CAPPED_INPARK::FLOAT AS SOCKS_W_MBR_CAPPED_INPARK
-    -- In-park only attach rate: socks are mandatory in-park; online is ~2% (optional) and dilutes the metric
     , (sk.SOCKS_W_MBR_CAPPED_INPARK / NULLIF(nm.NEW_MEMBERS_INPARK, 0))::FLOAT AS SOCK_ATTACH_RATE_INPARK
     , rc.RECURRING_MEMBERS_BILLED::FLOAT AS RECURRING_MEMBERS_BILLED
     , rc.RECURRING_DUES_COLLECTED::FLOAT AS RECURRING_DUES_COLLECTED
