@@ -103,36 +103,6 @@ mbr_upgrades AS (
     WHERE CANCEL_REASON = 'Upgraded'
     GROUP BY 1, 2
 ),
--- Churn broken out by reason, per park per month (by termination month); excludes upgrades
--- BUG FIX: Voluntary includes ('Cancel Requested', 'Refund', 'Cancel Assumed') and the legacy 'Term Roller'
-mbr_churn AS (
-    SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', SK_DATE_TERMINATION))                           AS MONTH_START
-        , SK_LOCATION_ACTIVE                                                                      AS SK_LOCATION
-        -- Voluntary: member-initiated cancels; all non-payment reasons bucketed here so totals reconcile
-        , SUM(CASE WHEN CANCEL_REASON NOT IN ('Payment Issue', 'Lapsed')
-                    AND CANCEL_REASON IS NOT NULL THEN 1 ELSE 0 END)                              AS CHURN_VOLUNTARY
-        -- Involuntary: billing failure or lapse due to non-payment
-        , SUM(CASE WHEN CANCEL_REASON IN ('Payment Issue', 'Lapsed') THEN 1 ELSE 0 END)           AS CHURN_INVOLUNTARY
-        , COUNT(DISTINCT SK_TICKET)                                                               AS CHURN_TOTAL
-    FROM mbr_facts_base 
-    WHERE SK_DATE_TERMINATION IS NOT NULL
-      AND CANCEL_REASON <> 'Upgraded'
-    GROUP BY 1, 2
-),
--- First-month churn attributed to the JOIN month, not the termination month.
--- Counts members who churned within 33 days of joining, bucketed by when they signed up.
-mbr_churn_first_month AS (
-    SELECT
-          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', SK_DATE_JOIN))      AS MONTH_START
-        , SK_LOCATION_ACTIVE                                          AS SK_LOCATION
-        , COUNT(DISTINCT SK_TICKET)                                   AS CHURN_FIRST_MONTH
-    FROM mbr_facts_base 
-    WHERE SK_DATE_TERMINATION IS NOT NULL
-      AND CANCEL_REASON <> 'Upgraded'
-      AND CANCEL_DAYS <= 33
-    GROUP BY 1, 2
-),
 -- Reactivated members per park per month
 -- A reactivation is any event where SK_EVENTTYPE = 6 ('Reactivated') in FACTMEMBERSHIPPASSEVENTS
 mbr_reactivated AS (
@@ -160,7 +130,7 @@ mbr_parent_addon AS (
     FROM mbr_facts_base me
     JOIN GOLD_DB.CNS.TBL_DIMPRODUCT p USING(SK_PRODUCT)
     LEFT JOIN GOLD_DB.DW.DIMCUSTOMER dc
-        ON  dc.SK_CUSTOMER     = me.SK_JUMPERCUSTOMER
+        ON  dc.SK_CUSTOMER = me.SK_JUMPERCUSTOMER
         AND dc.DWISCURRENTFLAG = 1
     WHERE me.SK_DATE_JOIN IS NOT NULL
       AND CONCAT(NVL(p.PRODUCTNAME,''), NVL(p.PARENTPRODUCTNAME,''))::STRING ILIKE '%parent%'
@@ -242,7 +212,6 @@ mbr_recurring_collected AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fr.SK_DATE_RECORD))           AS MONTH_START
         , lm.SK_LOCATION_ACTIVE                                                 AS SK_LOCATION
-        , COUNT(DISTINCT fr.SK_TICKET)                                          AS RECURRING_MEMBERS_BILLED
         , SUM(fr.MEMBERSHIP_REVENUE)                                            AS RECURRING_DUES_COLLECTED
     FROM GOLD_DB.CNS.TBL_FACTREVENUE fr
     JOIN location_map lm USING(SK_LOCATION)
@@ -251,29 +220,65 @@ mbr_recurring_collected AS (
     WHERE tpl.TRANSACTIONLOCATION ILIKE '%recurring%'
     GROUP BY 1, 2
 ),
--- Average duration (months) of members who churned in the reporting month. 
--- CHURNED_DUR_WTAVG_DAYS_SUM and CHURNED_DUR_WTAVG_MEMBER_COUNT are the numerator/denominator components for wavg — only use when rolling up to region or district. Do NOT use either column as a standalone metric.
-mbr_avg_duration_churned AS (
+-- New-member dues collected per park per month (NET of refunds), from TBL_FACTREVENUE NEW = TRANSACTIONLOCATION NOT ILIKE '%recurring%' (initial sale / activation, not recurring billing). consistent with COMPPARK_AZ logic.
+-- NEW_DUES_COLLECTED_WITH_REFUNDS: Venue Manager refund/reversal rows are NOT excluded, so they net against sales — matches COMPPARK_AZ COMP_REVENUE_NEW_MEMBERSHIP_WITH_REFUNDS.
+-- Bucketed by transaction date, so a refund processed in a later month nets against THAT month, not the original sale month.
+mbr_new_collected AS (
+    SELECT
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', fr.SK_DATE_RECORD))                                                  AS MONTH_START
+        , lm.SK_LOCATION_ACTIVE                                                                                        AS SK_LOCATION
+        , SUM(fr.MEMBERSHIP_REVENUE)                                                                                   AS NEW_DUES_COLLECTED_WITH_REFUNDS
+    FROM GOLD_DB.CNS.TBL_FACTREVENUE fr
+    JOIN location_map lm USING(SK_LOCATION)
+    LEFT JOIN GOLD_DB.DW.DIMTRANSACTIONPAYMENTLABEL tpl
+        ON tpl.SK_TRANSACTIONPAYMENTLABEL = fr.SK_TRANSACTIONPAYMENTLABEL
+    WHERE tpl.TRANSACTIONLOCATION NOT ILIKE '%recurring%'
+    GROUP BY 1, 2
+),
+-- Churn broken out by reason, per park per month (by termination month); excludes upgrades
+-- Upgraded tickets are EXCLUDED from the cohort (CANCEL_REASON <> 'Upgraded'). An upgrade mints a new SK_TICKET that re-enters as a fresh join in its own month, so the old upgraded ticket is dropped here rather than counted as retained.
+-- BUG FIX: Voluntary includes ('Cancel Requested', 'Refund', 'Cancel Assumed') and the legacy 'Term Roller'
+mbr_churned_by_reason AS (
+    SELECT
+          DATEADD('MONTH', 1, DATE_TRUNC('MONTH', SK_DATE_TERMINATION))                           AS MONTH_START
+        , SK_LOCATION_ACTIVE                                                                      AS SK_LOCATION
+        -- Voluntary: member-initiated cancels; all non-payment reasons bucketed here so totals reconcile
+        , SUM(CASE WHEN CANCEL_REASON NOT IN ('Payment Issue', 'Lapsed')
+                    AND CANCEL_REASON IS NOT NULL THEN 1 ELSE 0 END)                              AS CHURN_VOLUNTARY
+        -- Involuntary: billing failure or lapse due to non-payment
+        , SUM(CASE WHEN CANCEL_REASON IN ('Payment Issue', 'Lapsed') THEN 1 ELSE 0 END)           AS CHURN_INVOLUNTARY
+        , COUNT(DISTINCT SK_TICKET)                                                               AS CHURN_TOTAL
+    FROM mbr_facts_base 
+    WHERE SK_DATE_TERMINATION IS NOT NULL
+      AND CANCEL_REASON <> 'Upgraded'
+    GROUP BY 1, 2
+),
+-- Average duration (months) of members who CHURNED in the reporting month.
+-- DUR_CHURN_WTAVG_DAYS_SUM and DUR_CHURN_WTAVG_MEMBER_COUNT are the numerator/denominator components for wavg — only use when rolling up to region or district. Do NOT use either column as a standalone metric.
+-- WHY CHURNED-ONLY: Including all active members in a duration avg is misleading; their tenure is still in progress and grows every month  by staying active, causing the metric to drift down with new members join seasonality and upward as the base ages.
+-- Restricting to churned members gives a stable, completed-tenure view: "how long did members last before leaving?"
+mbr_churned_avg_duration AS (
     SELECT
           DATEADD('MONTH', 1, DATE_TRUNC('MONTH', f.SK_DATE_TERMINATION))   AS MONTH_START
         , f.SK_LOCATION_ACTIVE                                              AS SK_LOCATION
-        , ROUND(AVG(f.CANCEL_DAYS / 30.44), 2)                              AS AVG_DURATION_CHURNED_MONTHS
-        , SUM(f.CANCEL_DAYS)                                                AS CHURNED_DUR_WTAVG_DAYS_SUM
-        , COUNT(DISTINCT f.SK_TICKET)                                       AS CHURNED_DUR_WTAVG_MEMBER_COUNT
+        , ROUND(AVG(f.CANCEL_DAYS / 30.44), 2)                              AS DUR_CHURN_AVG_MONTHS
+        , SUM(f.CANCEL_DAYS)                                                AS DUR_CHURN_WTAVG_DAYS_SUM
+        , COUNT(DISTINCT f.SK_TICKET)                                       AS DUR_CHURN_WTAVG_MEMBER_COUNT
     FROM mbr_facts_base f
     WHERE f.SK_DATE_TERMINATION IS NOT NULL
       AND f.CANCEL_REASON <> 'Upgraded'
     GROUP BY 1, 2
 ),
 -- Rolling 12-month average duration of churned members. Pools the trailing 12 months of churn to smooth seasonal spikes — preferred for SPS forecasting.
--- ROLLING12M_DUR_WTAVG_DAYS_SUM and ROLLING12M_DUR_WTAVG_MEMBER_COUNT aare the numerator/denominator components for wavg — only use these together when rolling up to region or district. Do NOT use either column as a standalone metric.
-mbr_avg_duration_rolling12m AS (
+-- Same churned-only rationale as mbr_churned_avg_duration above; L12M window smooths month-to-month volatility from small churn cohorts.
+-- DUR_CHURN_L12M_WTAVG_DAYS_SUM and DUR_CHURN_L12M_WTAVG_MEMBER_COUNT are the numerator/denominator components for wavg — only use these together when rolling up to region or district. Do NOT use either column as a standalone metric.
+mbr_churned_avg_duration_l12m AS (
     SELECT
           pb.MONTH_START
         , pb.SK_LOCATION
-        , ROUND(AVG(f.CANCEL_DAYS / 30.44), 2)                              AS AVG_DURATION_ROLLING_12M_MONTHS
-        , SUM(f.CANCEL_DAYS)                                                AS ROLLING12M_DUR_WTAVG_DAYS_SUM
-        , COUNT(DISTINCT f.SK_TICKET)                                       AS ROLLING12M_DUR_WTAVG_MEMBER_COUNT
+        , ROUND(AVG(f.CANCEL_DAYS / 30.44), 2)                              AS DUR_CHURN_L12M_AVG_MONTHS
+        , SUM(f.CANCEL_DAYS)                                                AS DUR_CHURN_L12M_WTAVG_DAYS_SUM
+        , COUNT(DISTINCT f.SK_TICKET)                                       AS DUR_CHURN_L12M_WTAVG_MEMBER_COUNT
     FROM parks_base pb
     JOIN mbr_facts_base f
         ON  f.SK_LOCATION_ACTIVE   = pb.SK_LOCATION
@@ -282,8 +287,64 @@ mbr_avg_duration_rolling12m AS (
         AND f.SK_DATE_TERMINATION  IS NOT NULL
         AND f.CANCEL_REASON        <> 'Upgraded'
     GROUP BY 1, 2
+),
+-- Cohort retention + first-month attrition: for each park x join month, the genuine new-member cohort and how many survive to each milestone.
+-- Bucketed by join month. For each cohort, checks how many are still active at each month milestone.
+-- Milestone = N dunning cycles of 33 days each, measured from each member's own join date (CANCEL_DAYS > 33*N). 33 days = the dunning/lapse window, so this is consistent with CHURN_FIRST_MONTH (CANCEL_DAYS <= 33) rather than calendar months.
+mbr_retention AS (
+    SELECT
+          MONTH_START
+        , SK_LOCATION
+        , COUNT(DISTINCT SK_TICKET)                                                     AS COHORT_SIZE
+        , COUNT(DISTINCT CASE WHEN SK_DATE_TERMINATION IS NOT NULL AND CANCEL_DAYS <= 33
+                              THEN SK_TICKET END)                                        AS CHURN_FIRST_MONTH
+        -- Retained at milestone N = survived past N months / dunning cycles (CANCEL_DAYS > 33*N) or never terminated.
+        -- RETAINED_M1 = COHORT_SIZE - CHURN_FIRST_MONTH (CANCEL_DAYS > 33), so it stays the exact inverse of first-month attrition.
+        , COUNT(DISTINCT CASE WHEN SK_DATE_TERMINATION IS NULL OR CANCEL_DAYS > 33 * 1  THEN SK_TICKET END) AS RETAINED_M1
+        , COUNT(DISTINCT CASE WHEN SK_DATE_TERMINATION IS NULL OR CANCEL_DAYS > 33 * 2  THEN SK_TICKET END) AS RETAINED_M2
+        , COUNT(DISTINCT CASE WHEN SK_DATE_TERMINATION IS NULL OR CANCEL_DAYS > 33 * 3  THEN SK_TICKET END) AS RETAINED_M3
+        , COUNT(DISTINCT CASE WHEN SK_DATE_TERMINATION IS NULL OR CANCEL_DAYS > 33 * 4  THEN SK_TICKET END) AS RETAINED_M4
+        , COUNT(DISTINCT CASE WHEN SK_DATE_TERMINATION IS NULL OR CANCEL_DAYS > 33 * 5  THEN SK_TICKET END) AS RETAINED_M5
+        , COUNT(DISTINCT CASE WHEN SK_DATE_TERMINATION IS NULL OR CANCEL_DAYS > 33 * 6  THEN SK_TICKET END) AS RETAINED_M6
+        , COUNT(DISTINCT CASE WHEN SK_DATE_TERMINATION IS NULL OR CANCEL_DAYS > 33 * 9  THEN SK_TICKET END) AS RETAINED_M9
+        , COUNT(DISTINCT CASE WHEN SK_DATE_TERMINATION IS NULL OR CANCEL_DAYS > 33 * 12 THEN SK_TICKET END) AS RETAINED_M12_PLUS
+    FROM (
+        SELECT
+              DATEADD('MONTH', 1, DATE_TRUNC('MONTH', SK_DATE_JOIN))  AS MONTH_START
+            , SK_LOCATION_ACTIVE                                       AS SK_LOCATION
+            , SK_TICKET
+            , SK_DATE_TERMINATION
+            , CANCEL_REASON
+            , CANCEL_DAYS
+        FROM mbr_facts_base
+        WHERE SK_DATE_JOIN IS NOT NULL
+          AND (CANCEL_REASON IS NULL OR CANCEL_REASON <> 'Upgraded')
+    )
+    GROUP BY 1, 2
+),
+-- Active member age buckets: distributes active members at end of month into tenure bands.
+-- Uses day-level precision to avoid month-boundary artifacts.
+mbr_active_age_buckets AS (
+    SELECT
+          pb.MONTH_START
+        , pb.SK_LOCATION
+        , COUNT(DISTINCT CASE WHEN DATEDIFF('day', f.SK_DATE_JOIN, pb.MONTH_START) <   30 THEN f.SK_TICKET END) AS ACTIVE_AGE_LT1M
+        , COUNT(DISTINCT CASE WHEN DATEDIFF('day', f.SK_DATE_JOIN, pb.MONTH_START) >=  30
+                               AND DATEDIFF('day', f.SK_DATE_JOIN, pb.MONTH_START) <   91 THEN f.SK_TICKET END) AS ACTIVE_AGE_1TO3M
+        , COUNT(DISTINCT CASE WHEN DATEDIFF('day', f.SK_DATE_JOIN, pb.MONTH_START) >=  91
+                               AND DATEDIFF('day', f.SK_DATE_JOIN, pb.MONTH_START) <  183 THEN f.SK_TICKET END) AS ACTIVE_AGE_3TO6M
+        , COUNT(DISTINCT CASE WHEN DATEDIFF('day', f.SK_DATE_JOIN, pb.MONTH_START) >= 183
+                               AND DATEDIFF('day', f.SK_DATE_JOIN, pb.MONTH_START) <  274 THEN f.SK_TICKET END) AS ACTIVE_AGE_6TO9M
+        , COUNT(DISTINCT CASE WHEN DATEDIFF('day', f.SK_DATE_JOIN, pb.MONTH_START) >= 274
+                               AND DATEDIFF('day', f.SK_DATE_JOIN, pb.MONTH_START) <  365 THEN f.SK_TICKET END) AS ACTIVE_AGE_9TO12M
+        , COUNT(DISTINCT CASE WHEN DATEDIFF('day', f.SK_DATE_JOIN, pb.MONTH_START) >= 365                       THEN f.SK_TICKET END) AS ACTIVE_AGE_12M_PLUS
+    FROM parks_base pb
+    JOIN mbr_facts_base f
+        ON  f.SK_LOCATION_ACTIVE  = pb.SK_LOCATION
+        AND f.SK_DATE_JOIN        < pb.MONTH_START
+        AND (f.SK_DATE_TERMINATION IS NULL OR f.SK_DATE_TERMINATION >= pb.MONTH_START)
+    GROUP BY 1, 2
 )
-
 SELECT
       DATEADD('DAY', -1, pb.MONTH_START)::DATE AS SK_DATE_RECORD  --> Last day of the reporting month; joins to GOLD_DB.DW.DIMDATE in AAS
     , pb.SK_LOCATION::INT AS SK_LOCATION                          --> To join with GOLD_DB.CNS.TBL_DIMLOCATION in AAS (always current SK)
@@ -304,9 +365,9 @@ SELECT
     , c.CHURN_INVOLUNTARY::FLOAT AS CHURN_INVOLUNTARY
     , c.CHURN_TOTAL::FLOAT AS CHURN_TOTAL
     -- NULL until 33 days after the end of the join cohort month (one month prior to the row label)
-    , CASE WHEN CURRENT_DATE >= DATEADD(DAY, 33, LAST_DAY(DATEADD('MONTH', -1, pb.MONTH_START)))
-           THEN cfm.CHURN_FIRST_MONTH
-           ELSE NULL
+    , CASE WHEN CURRENT_DATE >= DATEADD(DAY, 33, LAST_DAY(DATEADD('MONTH', -1, pb.MONTH_START))) 
+            THEN rt.CHURN_FIRST_MONTH
+            ELSE NULL
       END::FLOAT AS CHURN_FIRST_MONTH
     , (NVL(nm.NEW_MEMBERS_TOTAL,0)
         - NVL(u.UPGRADES_TOTAL,0)
@@ -320,16 +381,32 @@ SELECT
     , sk.SOCKS_W_MBR_CAPPED::FLOAT AS SOCKS_W_MBR_CAPPED
     , sk.SOCKS_W_MBR_CAPPED_INPARK::FLOAT AS SOCKS_W_MBR_CAPPED_INPARK
     , (sk.SOCKS_W_MBR_CAPPED_INPARK / NULLIF(nm.NEW_MEMBERS_INPARK, 0))::FLOAT AS SOCK_ATTACH_RATE_INPARK
-    , rc.RECURRING_MEMBERS_BILLED::FLOAT AS RECURRING_MEMBERS_BILLED
     , rc.RECURRING_DUES_COLLECTED::FLOAT AS RECURRING_DUES_COLLECTED
-    , ad.AVG_DURATION_CHURNED_MONTHS::FLOAT AS DURATION_CHURNED_AVG_MONTHS
+    , nc.NEW_DUES_COLLECTED_WITH_REFUNDS::FLOAT AS NEW_DUES_COLLECTED_WITH_REFUNDS
+    , ad.DUR_CHURN_AVG_MONTHS::FLOAT AS DUR_CHURN_AVG_MONTHS
     -- Weighted avg components for region/district rollup only — do NOT use as standalone metrics.
-    , ad.CHURNED_DUR_WTAVG_DAYS_SUM::FLOAT AS DUR_CHURNED_WTAVG_DAYS_SUM
-    , ad.CHURNED_DUR_WTAVG_MEMBER_COUNT::FLOAT AS DUR_CHURNED_WTAVG_MEMBER_COUNT
-    , d12.AVG_DURATION_ROLLING_12M_MONTHS::FLOAT AS DURATION_AVG_ROLLING_12M
+    , ad.DUR_CHURN_WTAVG_DAYS_SUM::FLOAT AS DUR_CHURN_WTAVG_DAYS_SUM
+    , ad.DUR_CHURN_WTAVG_MEMBER_COUNT::FLOAT AS DUR_CHURN_WTAVG_MEMBER_COUNT
+    , d12.DUR_CHURN_L12M_AVG_MONTHS::FLOAT AS DUR_CHURN_L12M_AVG_MONTHS
     -- Weighted avg components for region/district rollup only — do NOT use as standalone metrics.
-    , d12.ROLLING12M_DUR_WTAVG_DAYS_SUM::FLOAT AS DUR_WTAVG_ROLLING12M_DAYS_SUM
-    , d12.ROLLING12M_DUR_WTAVG_MEMBER_COUNT::FLOAT AS DUR_WTAVG_ROLLING12M_MEMBER_COUNT
+    , d12.DUR_CHURN_L12M_WTAVG_DAYS_SUM::FLOAT AS DUR_CHURN_L12M_WTAVG_DAYS_SUM
+    , d12.DUR_CHURN_L12M_WTAVG_MEMBER_COUNT::FLOAT AS DUR_CHURN_L12M_WTAVG_MEMBER_COUNT
+    , rt.COHORT_SIZE::FLOAT AS RETENTION_COHORT_SIZE
+    , CASE WHEN CURRENT_DATE >= DATEADD('DAY', 33, LAST_DAY(DATEADD('MONTH', -1, pb.MONTH_START))) THEN rt.RETAINED_M1       ELSE NULL END::FLOAT AS RETENTION_RETAINED_M1
+    , CASE WHEN CURRENT_DATE >= DATEADD('DAY', 33, LAST_DAY(DATEADD('MONTH', -1, pb.MONTH_START))) THEN rt.RETAINED_M2       ELSE NULL END::FLOAT AS RETENTION_RETAINED_M2
+    , CASE WHEN CURRENT_DATE >= DATEADD('DAY', 33, LAST_DAY(DATEADD('MONTH', -1, pb.MONTH_START))) THEN rt.RETAINED_M3       ELSE NULL END::FLOAT AS RETENTION_RETAINED_M3
+    , CASE WHEN CURRENT_DATE >= DATEADD('DAY', 33, LAST_DAY(DATEADD('MONTH', -1, pb.MONTH_START))) THEN rt.RETAINED_M4       ELSE NULL END::FLOAT AS RETENTION_RETAINED_M4
+    , CASE WHEN CURRENT_DATE >= DATEADD('DAY', 33, LAST_DAY(DATEADD('MONTH', -1, pb.MONTH_START))) THEN rt.RETAINED_M5       ELSE NULL END::FLOAT AS RETENTION_RETAINED_M5
+    , CASE WHEN CURRENT_DATE >= DATEADD('DAY', 33, LAST_DAY(DATEADD('MONTH', -1, pb.MONTH_START))) THEN rt.RETAINED_M6       ELSE NULL END::FLOAT AS RETENTION_RETAINED_M6
+    , CASE WHEN CURRENT_DATE >= DATEADD('DAY', 33, LAST_DAY(DATEADD('MONTH', -1, pb.MONTH_START))) THEN rt.RETAINED_M9       ELSE NULL END::FLOAT AS RETENTION_RETAINED_M9
+    , CASE WHEN CURRENT_DATE >= DATEADD('DAY', 33, LAST_DAY(DATEADD('MONTH', -1, pb.MONTH_START))) THEN rt.RETAINED_M12_PLUS ELSE NULL END::FLOAT AS RETENTION_RETAINED_M12_PLUS
+    -- Active member age distribution at end of month
+    , ab.ACTIVE_AGE_LT1M::FLOAT AS ACTIVE_AGE_LT1M
+    , ab.ACTIVE_AGE_1TO3M::FLOAT AS ACTIVE_AGE_1TO3M
+    , ab.ACTIVE_AGE_3TO6M::FLOAT AS ACTIVE_AGE_3TO6M
+    , ab.ACTIVE_AGE_6TO9M::FLOAT AS ACTIVE_AGE_6TO9M
+    , ab.ACTIVE_AGE_9TO12M::FLOAT AS ACTIVE_AGE_9TO12M
+    , ab.ACTIVE_AGE_12M_PLUS::FLOAT AS ACTIVE_AGE_12M_PLUS
 FROM parks_base pb
 LEFT JOIN mbr_active am
     ON  am.SK_LOCATION = pb.SK_LOCATION
@@ -343,12 +420,9 @@ LEFT JOIN mbr_upgrades u
 LEFT JOIN mbr_reactivated r
     ON  r.SK_LOCATION = pb.SK_LOCATION
     AND r.MONTH_START = pb.MONTH_START
-LEFT JOIN mbr_churn c
+LEFT JOIN mbr_churned_by_reason c
     ON  c.SK_LOCATION = pb.SK_LOCATION
     AND c.MONTH_START = pb.MONTH_START
-LEFT JOIN mbr_churn_first_month cfm
-    ON  cfm.SK_LOCATION = pb.SK_LOCATION
-    AND cfm.MONTH_START = pb.MONTH_START
 LEFT JOIN mbr_parent_addon pa
     ON  pa.SK_LOCATION = pb.SK_LOCATION
     AND pa.MONTH_START = pb.MONTH_START
@@ -361,12 +435,21 @@ LEFT JOIN mbr_socks sk
 LEFT JOIN mbr_recurring_collected rc
     ON  rc.SK_LOCATION = pb.SK_LOCATION
     AND rc.MONTH_START = pb.MONTH_START
-LEFT JOIN mbr_avg_duration_churned ad
+LEFT JOIN mbr_new_collected nc
+    ON  nc.SK_LOCATION = pb.SK_LOCATION
+    AND nc.MONTH_START = pb.MONTH_START
+LEFT JOIN mbr_churned_avg_duration ad
     ON  ad.SK_LOCATION = pb.SK_LOCATION
     AND ad.MONTH_START = pb.MONTH_START
-LEFT JOIN mbr_avg_duration_rolling12m d12
+LEFT JOIN mbr_churned_avg_duration_l12m d12
     ON  d12.SK_LOCATION = pb.SK_LOCATION
     AND d12.MONTH_START = pb.MONTH_START
+LEFT JOIN mbr_retention rt
+    ON  rt.SK_LOCATION = pb.SK_LOCATION
+    AND rt.MONTH_START = pb.MONTH_START
+LEFT JOIN mbr_active_age_buckets ab
+    ON  ab.SK_LOCATION = pb.SK_LOCATION
+    AND ab.MONTH_START = pb.MONTH_START
 -- Only show months where the full calendar month is complete
 WHERE pb.MONTH_START <= DATE_TRUNC('MONTH', CURRENT_DATE)
 ORDER BY pb.MONTH_START DESC
